@@ -1,0 +1,7 @@
+config.json
+state/
+logs/
+shots/
+*.log
+*.png
+!docs/*.png

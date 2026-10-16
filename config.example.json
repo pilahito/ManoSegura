@@ -1,0 +1,7 @@
+{
+  "TargetMonitor": "primary",
+  "ShotsDir": "",
+  "ConfirmTimeoutSec": 20,
+  "TrustMaxMinutes": 60,
+  "ExtraBlockedTitles": []
+}

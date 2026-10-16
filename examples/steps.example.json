@@ -1,0 +1,9 @@
+{
+  "steps": [
+    { "cmd": "focus",      "args": ["Notepad"] },
+    { "cmd": "key",        "args": ["ctrl+a"] },
+    { "cmd": "paste",      "args": ["Hola desde ManoSegura / Hello from ManoSegura"] },
+    { "cmd": "wait",       "args": ["200"] },
+    { "cmd": "screenshot", "args": [] }
+  ]
+}

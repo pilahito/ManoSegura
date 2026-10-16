@@ -1,0 +1,44 @@
+ManoSegura Source-Available License v1.0
+(adaptación de la CloudTerm Source-Available License v1.0)
+
+SPDX-License-Identifier: LicenseRef-ManoSegura-SAL-1.0
+Copyright (c) 2026 pilahito — https://github.com/pilahito
+Todos los derechos reservados / All rights reserved.
+
+La versión en español prevalece; la inglesa es solo de referencia.
+The Spanish version prevails; the English text is for reference only.
+
+=============================== ESPAÑOL =======================================
+0. «Software»: ManoSegura, su código, documentación y ejemplos de este
+   repositorio. «Autor»: pilahito. «Tú»: quien obtenga el Software.
+1. SÍ puedes, gratis: a) descargar y USAR el Software (personal, interno o
+   profesional), incluido por asistentes/bots que actúen en nombre de un
+   usuario; b) leer y auditar el código; c) editar tu config.json local.
+2. NO puedes sin permiso previo y por escrito del Autor: a) modificar el
+   Software ni crear obras derivadas publicadas; b) redistribuirlo (espejos,
+   paquetes, tiendas); c) venderlo, sublicenciarlo u ofrecerlo como servicio
+   de pago; d) quitar o alterar avisos de copyright, de licencia o las reglas
+   de seguridad del código. Permisos: https://github.com/pilahito
+3. Contribuciones mediante pull request: concedes al Autor una licencia
+   perpetua, mundial, gratuita e irrevocable para usarlas bajo esta u otra
+   licencia.
+4. SIN GARANTÍA. EL SOFTWARE SE PROPORCIONA «TAL CUAL». EL AUTOR NO RESPONDE
+   DE DAÑOS DERIVADOS DE SU USO, EN LA MEDIDA MÁXIMA PERMITIDA POR LA LEY. Tú
+   eres responsable de lo que autorices hacer en tu equipo.
+5. Si incumples esta licencia, tus derechos terminan automáticamente.
+
+=============================== ENGLISH =======================================
+0. "Software": ManoSegura, its code, docs and examples in this repository.
+   "Author": pilahito. "You": whoever obtains the Software.
+1. You MAY, free of charge: a) download and USE the Software (personal,
+   internal or professional), including by assistants/bots acting for a user;
+   b) read and audit the code; c) edit your local config.json.
+2. You may NOT without the Author's prior written permission: a) modify it or
+   publish derivative works; b) redistribute it (mirrors, packages, stores);
+   c) sell, sublicense or offer it as a paid service; d) remove or alter
+   copyright/license notices or the in-code safety rules.
+3. Pull-request contributions grant the Author a perpetual, worldwide,
+   royalty-free, irrevocable license to use them under this or any license.
+4. NO WARRANTY. PROVIDED "AS IS". THE AUTHOR IS NOT LIABLE FOR ANY DAMAGES, TO
+   THE MAXIMUM EXTENT PERMITTED BY LAW. You are responsible for what you allow.
+5. Breaching this license terminates your rights automatically.
