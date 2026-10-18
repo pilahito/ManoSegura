@@ -1,0 +1,8 @@
+{
+  "steps": [
+    { "cmd": "focus",      "args": ["Brave"] },
+    { "cmd": "navigate",   "args": ["https://docs.godotengine.org/es/4.x/"] },
+    { "cmd": "wait",       "args": ["1500"] },
+    { "cmd": "screenshot", "args": [] }
+  ]
+}

@@ -3,5 +3,14 @@
   "ShotsDir": "",
   "ConfirmTimeoutSec": 20,
   "TrustMaxMinutes": 60,
-  "ExtraBlockedTitles": []
+  "ExtraBlockedTitles": [],
+  "Language": "es",
+  "Navigation": "off",
+  "UrlAllowlist": [],
+  "ExtraBlockedUrls": [],
+  "AllowNewTabs": false,
+  "MaxActionsPerMinute": 60,
+  "Overlay": true,
+  "GuardIdleMinutes": 30,
+  "ExtraBrowsers": []
 }
