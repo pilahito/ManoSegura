@@ -1,0 +1,61 @@
+name: tests
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: ${{ matrix.shell }} on windows-latest
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        shell: [powershell, pwsh]   # Windows PowerShell 5.1 and PowerShell 7
+    defaults:
+      run:
+        shell: ${{ matrix.shell }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Pester and PSScriptAnalyzer
+        run: |
+          if ($PSVersionTable.PSEdition -eq 'Desktop') { Install-PackageProvider -Name NuGet -MinimumVersion 2.8.5.201 -Force -Scope CurrentUser | Out-Null }
+          Set-PSRepository PSGallery -InstallationPolicy Trusted
+          Install-Module Pester -MinimumVersion 5.5.0 -Scope CurrentUser -Force -SkipPublisherCheck
+          Install-Module PSScriptAnalyzer -Scope CurrentUser -Force
+
+      - name: PSScriptAnalyzer
+        run: |
+          $r = Invoke-ScriptAnalyzer -Path . -Recurse -Settings ./PSScriptAnalyzerSettings.psd1
+          $r | Format-Table -AutoSize | Out-String -Width 200
+          if ($r) { throw "PSScriptAnalyzer: $(@($r).Count) problema(s)" }
+
+      - name: Pester
+        run: |
+          Import-Module Pester -MinimumVersion 5.5.0
+          $c = New-PesterConfiguration
+          $c.Run.Path = './tests'
+          $c.Run.Exit = $true
+          $c.Output.Verbosity = 'Detailed'
+          $c.TestResult.Enabled = $true
+          $c.TestResult.OutputPath = 'testResults-${{ matrix.shell }}.xml'
+          Invoke-Pester -Configuration $c
+
+      - name: Smoke test (no Bypass needed)
+        run: |
+          Get-ChildItem -Recurse | Unblock-File
+          $j = (powershell -NoProfile -ExecutionPolicy RemoteSigned -File .\ManoSegura.ps1 version --json) | ConvertFrom-Json
+          if (-not $j.ok) { throw 'version --json failed' }
+          $j = (powershell -NoProfile -ExecutionPolicy RemoteSigned -File .\ManoSegura.ps1 check-title "Recibidos - Gmail" --json) | ConvertFrom-Json
+          if (-not $j.results[0].blocked) { throw 'Gmail should be blocked' }
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: test-results-${{ matrix.shell }}
+          path: testResults-*.xml
