@@ -1,0 +1,38 @@
+name: Build Windows EXE
+
+on:
+  workflow_dispatch:
+  pull_request:
+    branches: [main]
+    paths:
+      - 'ManoSegura.ps1'
+      - 'build-exe.ps1'
+      - '.github/workflows/build-exe.yml'
+  push:
+    branches: [main]
+    paths:
+      - 'ManoSegura.ps1'
+      - 'build-exe.ps1'
+      - '.github/workflows/build-exe.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Build ManoSegura.exe
+        shell: pwsh
+        run: ./build-exe.ps1 -OutputDirectory ./dist
+
+      - name: Upload executable
+        uses: actions/upload-artifact@v4
+        with:
+          name: ManoSegura-windows-x64
+          path: dist/ManoSegura.exe
+          if-no-files-found: error
+          retention-days: 30
