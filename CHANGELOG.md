@@ -9,6 +9,7 @@ Formato basado en [Keep a Changelog](https://keepachangelog.com/es-ES/1.1.0/); v
 - Comandos `drag`, `focus` (también dentro de batch), `config set`, `monitors`.
 - Opciones globales `--yes`, `--dry-run` y `--format png|jpg`.
 - Ajustes nuevos: `ConfirmMode` (`ask`/`auto`), `ClickDelayMs`, `MaxBatchSteps`, `BlockedTitles`, `ShotFormat`, `LogLines`, `PanicHotkey`.
+- **Tiempo de confianza ampliable**: presets 10 min / 30 min / 1 h / 2 h / 3 h o personalizado en la interfaz, con boton **Ampliar tiempo** y **Quitar**; por CLI `trust 1h`, `trust add 30m` o `trust +30m`.
 - Ejemplo de batch actualizado y `config.example.json` nuevo.
 - Tests Pester 5 reescritos y CI para PowerShell 5.1 y 7.
 

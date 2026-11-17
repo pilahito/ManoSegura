@@ -353,6 +353,54 @@ function Set-ManoTrustMinutes {
     $Minutes
 }
 
+
+function Convert-ManoTrustSpec {
+    param([string]$Spec)
+    $text = ("$Spec" -replace '\s', '').ToLowerInvariant()
+    if (-not $text) { Throw-ManoError 'Uso: trust 10m | 30m | 1h | 2h | 3h | 90 | 1h30m' 1 }
+    $pattern = '(\d+(?:\.\d+)?)(horas?|mins?|minutos?|h|m)?'
+    $timeParts = [regex]::Matches($text, $pattern)
+    if ($timeParts.Count -eq 0) { Throw-ManoError "No entiendo el tiempo '$Spec'. Ejemplos: 10m, 30m, 1h, 2h, 3h, 90, 1h30m." 1 }
+    $consumed = ($timeParts | ForEach-Object { $_.Value }) -join ''
+    if ($consumed -ne $text) { Throw-ManoError "No entiendo el tiempo '$Spec'. Ejemplos: 10m, 30m, 1h, 2h, 3h, 90, 1h30m." 1 }
+    $total = 0.0
+    foreach ($match in $timeParts) {
+        $number = [double]$match.Groups[1].Value
+        $unit = $match.Groups[2].Value
+        if ($unit -eq 'h' -or $unit -like 'hora*') { $total += $number * 60 } else { $total += $number }
+    }
+    $minutes = [int][math]::Round($total)
+    if ($minutes -lt 1) { Throw-ManoError 'El tiempo minimo es 1 minuto.' 1 }
+    $minutes
+}
+
+function Add-ManoTrustMinutes {
+    param([int]$Minutes)
+    if ($Minutes -lt 1) { $Minutes = 1 }
+    $now = Get-Date
+    $max = [int]$script:Cfg.TrustMaxMinutes
+    $base = $now
+    $extended = $false
+    if (Test-ManoTrustActive) {
+        try { $expiry = Get-ManoTrustExpiry (Get-Content -LiteralPath $script:TrustFile -Raw) } catch { $expiry = $null }
+        if ($expiry -and $expiry -gt $now) { $base = $expiry; $extended = $true }
+    }
+    $target = $base.AddMinutes($Minutes)
+    $limit = $now.AddMinutes($max)
+    $capped = $false
+    if ($target -gt $limit) { $target = $limit; $capped = $true }
+    $target.ToString('o') | Set-Content -LiteralPath $script:TrustFile
+    Write-ManoLog "modo confianza hasta $($target.ToString('HH:mm')) (extendido=$extended)"
+    [pscustomobject]@{ Expiry = $target; TotalMinutes = [int][math]::Round(($target - $now).TotalMinutes); Extended = $extended; Capped = $capped }
+}
+
+function Get-ManoTrustRemainingMinutes {
+    if (-not (Test-ManoTrustActive)) { return 0 }
+    try { $expiry = Get-ManoTrustExpiry (Get-Content -LiteralPath $script:TrustFile -Raw) } catch { return 0 }
+    if (-not $expiry) { return 0 }
+    [int][math]::Ceiling(($expiry - (Get-Date)).TotalMinutes)
+}
+
 function Clear-ManoTrust {
     Remove-Item -LiteralPath $script:TrustFile -Force -ErrorAction SilentlyContinue
     Write-ManoLog 'modo confianza desactivado'
@@ -702,12 +750,19 @@ function Confirm-ManoAction {
 
     $check = New-Object System.Windows.Forms.CheckBox
     $check.Location = New-Object System.Drawing.Point(24, 220)
-    $check.Size = New-Object System.Drawing.Size(250, 24)
-    $check.Text = 'Modo confianza durante (min):'
+    $check.Size = New-Object System.Drawing.Size(170, 24)
+    $check.Text = 'Confianza (min):'
     $check.ForeColor = Get-ManoUiColor 'Text'
     $check.BackColor = Get-ManoUiColor 'Bg'
+    $preset = New-Object System.Windows.Forms.ComboBox
+    $preset.Location = New-Object System.Drawing.Point(204, 220)
+    $preset.Size = New-Object System.Drawing.Size(130, 26)
+    $preset.DropDownStyle = 'DropDownList'
+    $preset.BackColor = Get-ManoUiColor 'CardAlt'
+    $preset.ForeColor = Get-ManoUiColor 'Text'
+    [void]$preset.Items.AddRange(@('10 min', '30 min', '1 h', '2 h', '3 h'))
     $numeric = New-Object System.Windows.Forms.NumericUpDown
-    $numeric.Location = New-Object System.Drawing.Point(280, 220)
+    $numeric.Location = New-Object System.Drawing.Point(344, 220)
     $numeric.Size = New-Object System.Drawing.Size(70, 26)
     $numeric.Minimum = 1
     $numeric.Maximum = [int]$script:Cfg.TrustMaxMinutes
@@ -715,8 +770,13 @@ function Confirm-ManoAction {
     $numeric.BackColor = Get-ManoUiColor 'CardAlt'
     $numeric.ForeColor = Get-ManoUiColor 'Text'
     $numeric.BorderStyle = 'FixedSingle'
-    if ($NoTrust) { $check.Enabled = $false; $numeric.Enabled = $false }
-    $form.Controls.AddRange(@($check, $numeric))
+    if ($NoTrust) { $check.Enabled = $false; $numeric.Enabled = $false; $preset.Enabled = $false }
+    $preset.Add_SelectedIndexChanged({
+            $map = @{ '10 min' = 10; '30 min' = 30; '1 h' = 60; '2 h' = 120; '3 h' = 180 }
+            $key = [string]$preset.SelectedItem
+            if ($map.ContainsKey($key)) { $numeric.Value = [math]::Min([int]$map[$key], [int]$numeric.Maximum) }
+        })
+    $form.Controls.AddRange(@($check, $preset, $numeric))
 
     $count = New-Object System.Windows.Forms.Label
     $count.Location = New-Object System.Drawing.Point(24, 258)
@@ -1234,10 +1294,11 @@ function Update-ManoGuiStatus {
     if ($g.SideMonitor) { $g.SideMonitor.Text = 'Monitor: ' + (Get-ManoClipped $monitorText 34) }
     if ($g.SideHotkey) { $g.SideHotkey.Text = 'Panico: ' + $script:Cfg.PanicHotkey }
     if ($g.TopTrust) {
-        $g.TopTrust.Text = if ($trust) { 'Quitar confianza' } else { 'Confiar 10 min' }
-        $g.TopTrust.BackColor = if ($trust) { Get-ManoUiColor 'Warn' } else { Get-ManoUiColor 'CardAlt' }
-        $g.TopTrust.ForeColor = if ($trust) { Get-ManoUiColor 'AccentText' } else { Get-ManoUiColor 'Text' }
+        $g.TopTrust.Text = if ($trust) { 'Ampliar tiempo' } else { 'Confiar' }
+        $g.TopTrust.BackColor = if ($trust) { Get-ManoUiColor 'Warn' } else { Get-ManoUiColor 'Accent' }
+        $g.TopTrust.ForeColor = Get-ManoUiColor 'AccentText'
     }
+    if ($g.TopUntrust) { $g.TopUntrust.Visible = $trust }
     if ($g.TopActivate) { $g.TopActivate.Enabled = $disabled; $g.TopActivate.Visible = $disabled }
     if ($g.Panic) { $g.Panic.Enabled = -not $disabled }
     if ($g.StatusLabel) {
@@ -1559,7 +1620,7 @@ function Show-ManoGui {
     $headTable.ColumnCount = 2
     $headTable.RowCount = 1
     $headTable.ColumnStyles.Add((New-Object System.Windows.Forms.ColumnStyle([System.Windows.Forms.SizeType]::Percent, 100))) | Out-Null
-    $headTable.ColumnStyles.Add((New-Object System.Windows.Forms.ColumnStyle([System.Windows.Forms.SizeType]::Absolute, 330))) | Out-Null
+    $headTable.ColumnStyles.Add((New-Object System.Windows.Forms.ColumnStyle([System.Windows.Forms.SizeType]::Absolute, 430))) | Out-Null
     $header.Controls.Add($headTable)
 
     $headLeft = New-Object System.Windows.Forms.Panel
@@ -1567,7 +1628,7 @@ function Show-ManoGui {
     $headLeft.Margin = New-Object System.Windows.Forms.Padding(0)
     $headLeft.BackColor = Get-ManoUiColor 'Bg'
     $headTable.Controls.Add($headLeft, 0, 0)
-    $g.HeaderTitle = New-ManoUiLabel -Parent $headLeft -Text 'Ventanas' -X 0 -Y 2 -W 520 -H 32 -Size 18 -Bold
+    $g.HeaderTitle = New-ManoUiLabel -Parent $headLeft -Text 'Ventanas' -X 0 -Y 2 -W 460 -H 32 -Size 18 -Bold
     $g.HeaderSub = New-ManoUiLabel -Parent $headLeft -Text '' -X 0 -Y 40 -W 560 -H 20 -Size 9 -Color 'Muted'
 
     $headRight = New-Object System.Windows.Forms.Panel
@@ -1575,12 +1636,48 @@ function Show-ManoGui {
     $headRight.Margin = New-Object System.Windows.Forms.Padding(0)
     $headRight.BackColor = Get-ManoUiColor 'Bg'
     $headTable.Controls.Add($headRight, 1, 0)
-    $g.TopTrust = New-ManoUiButton -Parent $headRight -Text 'Confiar 10 min' -X 0 -Y 10 -W 150 -H 38 -Kind subtle
+    $g.TrustPreset = New-Object System.Windows.Forms.ComboBox
+    $g.TrustPreset.Location = New-Object System.Drawing.Point(0, 15)
+    $g.TrustPreset.Size = New-Object System.Drawing.Size(130, 28)
+    $g.TrustPreset.DropDownStyle = 'DropDownList'
+    $g.TrustPreset.BackColor = Get-ManoUiColor 'CardAlt'
+    $g.TrustPreset.ForeColor = Get-ManoUiColor 'Text'
+    $g.TrustPreset.Font = New-Object System.Drawing.Font('Segoe UI', 9.5)
+    [void]$g.TrustPreset.Items.AddRange(@('10 min', '30 min', '1 h', '2 h', '3 h', 'Personalizado...'))
+    $g.TrustPreset.SelectedIndex = 0
+    $headRight.Controls.Add($g.TrustPreset)
+    $g.TopTrust = New-ManoUiButton -Parent $headRight -Text 'Confiar' -X 138 -Y 10 -W 150 -H 38 -Kind primary
     $g.TopTrust.Add_Click({
-            if (Test-ManoTrustActive) { Clear-ManoTrust } else { [void](Set-ManoTrustMinutes 10) }
-            Update-ManoGuiStatus
+            $spec = [string]$script:Gui.TrustPreset.SelectedItem
+            try {
+                if ($spec -like 'Personalizado*') {
+                    $custom = Show-ManoInputDialog -Title 'Tiempo de confianza' -Label 'Cuanto tiempo? (ej: 45m, 1h30m, 90)' -DefaultValue '45'
+                    if (-not $custom) { return }
+                    $minutes = Convert-ManoTrustSpec $custom
+                } elseif ($spec -match '^(\d+)\s*min$') {
+                    $minutes = [int]$Matches[1]
+                } elseif ($spec -match '^(\d+)\s*h$') {
+                    $minutes = [int]$Matches[1] * 60
+                } else {
+                    $minutes = Convert-ManoTrustSpec $spec
+                }
+                if (Test-ManoTrustActive) {
+                    $result = Add-ManoTrustMinutes $minutes
+                    $script:Gui.LogBox.AppendText("Confianza +$minutes min (hasta $($result.Expiry.ToString('HH:mm')))" + [Environment]::NewLine)
+                } else {
+                    [void](Set-ManoTrustMinutes $minutes)
+                    $script:Gui.LogBox.AppendText("Confianza $minutes min" + [Environment]::NewLine)
+                }
+                Update-ManoGuiStatus
+            } catch [ManoError] {
+                [void][System.Windows.Forms.MessageBox]::Show($_.Exception.Message, 'ManoSegura', 'OK', 'Warning')
+            } catch {
+                [void][System.Windows.Forms.MessageBox]::Show($_.Exception.Message, 'ManoSegura', 'OK', 'Error')
+            }
         })
-    $g.TopActivate = New-ManoUiButton -Parent $headRight -Text 'Activar' -X 160 -Y 10 -W 100 -H 38 -Kind primary
+    $g.TopUntrust = New-ManoUiButton -Parent $headRight -Text 'Quitar' -X 296 -Y 10 -W 80 -H 38 -Kind subtle
+    $g.TopUntrust.Add_Click({ Clear-ManoTrust; Update-ManoGuiStatus })
+    $g.TopActivate = New-ManoUiButton -Parent $headRight -Text 'Activar' -X 306 -Y 10 -W 100 -H 38 -Kind primary
     $g.TopActivate.Add_Click({
             Set-ManoDisabled -Disabled $false
             Update-ManoGuiStatus
@@ -2225,7 +2322,8 @@ ACCIONES (pueden pedir permiso)
 
 CONTROL
   status                      estado: ventana, monitor, confianza, desactivada
-  trust [min]                 modo confianza temporal (por defecto 10 min)
+  trust [tiempo]              confianza temporal: 10m, 30m, 1h, 2h, 3h, 90, 1h30m
+  trust add <tiempo>         anade tiempo a la confianza activa (o trust +30m)
   untrust                     quita el modo confianza
   panic                       desactiva ManoSegura y corta acciones
   enable                      reactiva ManoSegura
@@ -2274,6 +2372,8 @@ function Show-ManoStatus {
     if (Test-ManoTrustActive) {
         $expiry = Get-ManoTrustExpiry (Get-Content -LiteralPath $script:TrustFile -Raw -ErrorAction SilentlyContinue)
         if ($expiry) { "Confianza hasta: $($expiry.ToString('yyyy-MM-dd HH:mm:ss'))" }
+        $remaining = Get-ManoTrustRemainingMinutes
+        if ($remaining -gt 0) { "Confianza restante: $remaining min" }
     }
     try {
         $monitor = Get-ManoTargetMonitor
@@ -2407,13 +2507,23 @@ function Invoke-ManoMain {
                 return
             }
             'trust' {
-                $minutes = 10
-                if ($argsList.Count -ge 1) {
-                    $parsedMinutes = 0
-                    if ([int]::TryParse($argsList[0], [ref]$parsedMinutes)) { $minutes = $parsedMinutes }
+                $raw = @($argsList)
+                $isAdd = $false
+                if ($raw.Count -ge 1 -and (($raw[0] -in @('add', '+', 'extender', 'sumar')) -or $raw[0].StartsWith('+'))) {
+                    $isAdd = $true
+                    if ($raw[0] -in @('add', '+', 'extender', 'sumar')) { $raw = @($raw | Select-Object -Skip 1) }
+                    else { $raw[0] = $raw[0].TrimStart('+') }
                 }
-                [void](Set-ManoTrustMinutes $minutes)
-                "OK modo confianza $minutes min"
+                $minutes = if ($raw.Count -ge 1) { Convert-ManoTrustSpec ($raw -join '') } else { 10 }
+                if ($isAdd) {
+                    $result = Add-ManoTrustMinutes $minutes
+                    $limitNote = if ($result.Capped) { ' [limitado por TrustMaxMinutes]' } else { '' }
+                    "OK confianza hasta $($result.Expiry.ToString('yyyy-MM-dd HH:mm')) (+$minutes min, total $($result.TotalMinutes) min)$limitNote"
+                } else {
+                    $actual = Set-ManoTrustMinutes $minutes
+                    $limitNote = if ($actual -lt $minutes) { ' [limitado por TrustMaxMinutes]' } else { '' }
+                    "OK modo confianza $actual min (hasta $((Get-Date).AddMinutes($actual).ToString('HH:mm')))$limitNote"
+                }
                 return
             }
             'untrust' { Clear-ManoTrust; 'OK modo confianza desactivado'; return }

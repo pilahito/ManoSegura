@@ -231,3 +231,53 @@ Describe 'Utilidades' {
         }
     }
 }
+
+Describe 'Tiempo de confianza' {
+    It 'entiende presets y formatos de tiempo' {
+        Convert-ManoTrustSpec '10m' | Should -Be 10
+        Convert-ManoTrustSpec '30' | Should -Be 30
+        Convert-ManoTrustSpec '1h' | Should -Be 60
+        Convert-ManoTrustSpec '2h' | Should -Be 120
+        Convert-ManoTrustSpec '3h' | Should -Be 180
+        Convert-ManoTrustSpec '90m' | Should -Be 90
+        Convert-ManoTrustSpec '1h30m' | Should -Be 90
+        Convert-ManoTrustSpec '1.5h' | Should -Be 90
+        Convert-ManoTrustSpec '45 min' | Should -Be 45
+        { Convert-ManoTrustSpec 'luego' } | Should -Throw
+        { Convert-ManoTrustSpec '0m' } | Should -Throw
+        { Convert-ManoTrustSpec '' } | Should -Throw
+    }
+
+    It 'anade tiempo sobre la confianza activa' {
+        Clear-ManoTrust
+        [void](Set-ManoTrustMinutes 10)
+        $result = Add-ManoTrustMinutes 20
+        $result.Extended | Should -BeTrue
+        $result.TotalMinutes | Should -BeGreaterThan 25
+        $result.TotalMinutes | Should -BeLessOrEqual 31
+        Get-ManoTrustRemainingMinutes | Should -BeGreaterThan 25
+    }
+
+    It 'respeta TrustMaxMinutes al ampliar' {
+        Clear-ManoTrust
+        $script:Cfg.TrustMaxMinutes = 60
+        [void](Set-ManoTrustMinutes 30)
+        $result = Add-ManoTrustMinutes 120
+        $result.Capped | Should -BeTrue
+        $result.TotalMinutes | Should -BeLessOrEqual 61
+        $script:Cfg.TrustMaxMinutes = 120
+    }
+
+    It 'si la confianza caduco empieza desde ahora' {
+        Clear-ManoTrust
+        (Get-Date).AddMinutes(-5).ToString('o') | Set-Content -LiteralPath $script:TrustFile
+        $result = Add-ManoTrustMinutes 10
+        $result.Extended | Should -BeFalse
+        $result.TotalMinutes | Should -BeLessOrEqual 11
+    }
+
+    It 'sin confianza no hay minutos restantes' {
+        Clear-ManoTrust
+        Get-ManoTrustRemainingMinutes | Should -Be 0
+    }
+}

@@ -49,7 +49,7 @@ powershell -NoProfile -ExecutionPolicy RemoteSigned -File .\ManoSegura.ps1
 .\ManoSegura.ps1 use "Bloc de notas"
 
 # 10 minutos de confianza (sin diálogo en cada acción)
-.\ManoSegura.ps1 trust 10
+.\ManoSegura.ps1 trust 1h
 
 # Acciones
 .\ManoSegura.ps1 shot
@@ -74,7 +74,21 @@ powershell -NoProfile -ExecutionPolicy RemoteSigned -File .\ManoSegura.ps1
 | **Ajustes** | Todos los ajustes de `config.json` con formulario; se guardan al momento. |
 | **Registro** | Últimas líneas del registro y botón para abrir la carpeta. |
 
-Arriba: estado (ventana, monitor, confianza), **PANICO**, **Activar** y **Confiar 10 min**. Un borde naranja (rojo en confianza) marca la ventana controlada. El atajo de pánico (`Ctrl+Alt+P` por defecto) funciona mientras la interfaz está abierta.
+Arriba: estado (ventana, monitor, confianza), **PANICO**, **Activar** y el selector de confianza (**10 min**, **30 min**, **1 h**, **2 h**, **3 h** o **Personalizado...**). Si ya hay confianza activa, el botón cambia a **Ampliar tiempo** y **Quitar** la retira. Un borde naranja (rojo en confianza) marca la ventana controlada. El atajo de pánico (`Ctrl+Alt+P` por defecto) funciona mientras la interfaz está abierta.
+
+## Tiempo de confianza
+
+En la interfaz, elige **10 min**, **30 min**, **1 h**, **2 h**, **3 h** o **Personalizado...** y pulsa **Confiar**. Si ya hay confianza activa, el mismo botón pasa a **Ampliar tiempo** (suma minutos a la caducidad actual) y **Quitar** la desactiva. Por CLI:
+
+```powershell
+.\ManoSegura.ps1 trust 30m
+.\ManoSegura.ps1 trust 2h
+.\ManoSegura.ps1 trust add 30m     # o trust +30m
+.\ManoSegura.ps1 trust 1h30m      # 90 minutos
+.\ManoSegura.ps1 untrust
+```
+
+El máximo total lo pone `TrustMaxMinutes` en `config.json` (120 por defecto, hasta 1440). `status` muestra los minutos restantes.
 
 ## Comandos
 
@@ -95,7 +109,9 @@ Arriba: estado (ventana, monitor, confianza), **PANICO**, **Activar** y **Confia
 | `wait [ms]` | Espera (máximo 10 s). |
 | `batch <fichero.json\|->` | Varios pasos con un solo permiso. |
 | `status` | Estado completo. |
-| `trust [min]` / `untrust` | Modo confianza temporal. |
+| `trust [tiempo]` | Modo confianza: `10m`, `30m`, `1h`, `2h`, `3h`, `90`, `1h30m` (por defecto 10 min). |
+| `trust add <tiempo>` / `trust +30m` | Añade tiempo a la confianza activa. |
+| `untrust` | Quita el modo confianza. |
 | `panic` / `enable` / `disable` | Desactiva o reactiva ManoSegura. |
 | `config [show\|path\|reset]` | Muestra, abre o reinicia la configuración. |
 | `config set <clave> <valor>` | Cambia un ajuste. |
@@ -137,7 +153,7 @@ Ejemplo en `config.example.json`. La configuración se valida al cargar: si algo
 - **Nunca escribe en campos de contraseña** (comprobación de UI Automation).
 - **Bloquea ventanas sensibles** (login, contraseñas, Gmail/Outlook, pagos, banca…). La lista es configurable y se puede desactivar con `BlockSensitiveWindows=false`.
 - **Pánico**: `Ctrl+Alt+P` mientras la interfaz está abierta, o `panic` por CLI; desactiva ManoSegura y revoca la confianza. El estado persiste hasta `enable`.
-- **Confianza con caducidad**: `trust 10` durante 10 minutos; nunca más de `TrustMaxMinutes`.
+- **Confianza con caducidad y ampliable**: presets de 10 min, 30 min, 1 h, 2 h, 3 h o tiempo personalizado; `trust add` añade minutos sobre lo que queda. Nunca pasa de `TrustMaxMinutes` (120 min por defecto).
 - No hace admin, no descarga nada, no crea scripts temporales ni usa `-EncodedCommand`/`Invoke-Expression`.
 - El historial queda en `logs/manosegura.log`; no hay cadena de hashes (simplificado en la 2.0).
 
@@ -162,7 +178,7 @@ Hay un ejemplo en `examples/steps.example.json`. Todos los pasos se validan ante
 
 1. `list` → el asistente ve ventanas y hwnd.
 2. `use "<titulo>"` → tú confirmas la ventana objetivo.
-3. `trust 10` (o `ConfirmMode=auto` en un entorno controlado) → trabaja sin interrumpirte.
+3. `trust 1h` (o `ConfirmMode=auto` en un entorno controlado) → trabaja sin interrumpirte; si se acaba, `trust add 30m`.
 4. El asistente hace `click`, `type`, `key`, `shot`…
 5. `panic` (o `Ctrl+Alt+P`) si algo va mal.
 
