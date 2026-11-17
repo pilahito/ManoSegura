@@ -1,16 +1,15 @@
 {
   "TargetMonitor": "primary",
-  "ShotsDir": "",
+  "ConfirmMode": "ask",
   "ConfirmTimeoutSec": 20,
-  "TrustMaxMinutes": 60,
-  "ExtraBlockedTitles": [],
-  "Language": "es",
-  "Navigation": "off",
-  "UrlAllowlist": [],
-  "ExtraBlockedUrls": [],
-  "AllowNewTabs": false,
-  "MaxActionsPerMinute": 60,
+  "TrustMaxMinutes": 120,
+  "ShotsDir": "",
+  "ShotFormat": "png",
+  "ClickDelayMs": 30,
+  "MaxBatchSteps": 50,
   "Overlay": true,
-  "GuardIdleMinutes": 30,
-  "ExtraBrowsers": []
+  "BlockSensitiveWindows": true,
+  "BlockedTitles": [],
+  "PanicHotkey": "Ctrl+Alt+P",
+  "LogLines": 500
 }

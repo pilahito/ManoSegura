@@ -1,9 +1,13 @@
 {
   "steps": [
-    { "cmd": "focus",      "args": ["Notepad"] },
-    { "cmd": "key",        "args": ["ctrl+a"] },
-    { "cmd": "paste",      "args": ["Hola desde ManoSegura / Hello from ManoSegura"] },
-    { "cmd": "wait",       "args": ["200"] },
-    { "cmd": "screenshot", "args": [] }
+    { "cmd": "focus",  "args": ["Bloc de notas"] },
+    { "cmd": "key",    "args": ["ctrl+a"] },
+    { "cmd": "paste",  "args": ["Hola desde ManoSegura / Hello from ManoSegura"] },
+    { "cmd": "wait",   "args": ["200"] },
+    { "cmd": "screenshot", "args": [] },
+    { "cmd": "click",  "args": ["60", "80"] },
+    { "cmd": "scroll", "args": ["-2"] },
+    { "cmd": "drag",   "args": ["40", "40", "180", "120"] },
+    { "cmd": "type",   "args": ["fin"] }
   ]
 }

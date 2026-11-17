@@ -1,1586 +1,2472 @@
 #Requires -Version 5.1
 <#
 .SYNOPSIS
-  ManoSegura - "mano remota" segura: un asistente de IA controla UNA ventana en UN monitor elegido de Windows,
-  siempre con tu permiso. / A safe "remote hand": an AI assistant controls ONE window on ONE chosen monitor.
+  ManoSegura 2.0 - "mano remota" segura para que un asistente de IA controle UNA ventana
+  en UN monitor de Windows, con interfaz grafica, mas opciones y menos tramites.
 
 .DESCRIPTION
-  - Sin descargas, sin admin, sin ventanas ocultas, sin comandos codificados. / No downloads, no admin, no hidden windows.
-  - Cada accion pide permiso (o usa un "modo confianza" con tiempo limite). / Every action asks first (or time-limited trust).
-  - Panico / panic: Ctrl+Alt+P detiene todo y desactiva ManoSegura hasta que TU ejecutes "enable".
-  - Mientras esta activa se ve: icono en la bandeja, cartel abajo en el monitor y un borde alrededor de la ventana controlada.
-  Uso / usage:  powershell -NoProfile -File .\ManoSegura.ps1 <comando> [args] [--dry-run] [--json] [--en|--es]
-  Instalacion sin "-ExecutionPolicy Bypass": ver README.md (Unblock-File + RemoteSigned, o firma propia).
+  - Interfaz grafica (comando "ui" o sin argumentos): ventanas, acciones, ajustes y registro.
+  - CLI simple y scriptable para todo lo demas.
+  - Safety basico: ventana objetivo unica, monitor elegido, bloqueo de campos de contrasena
+    y ventanas sensibles, tecla de panico, modo confianza con caducidad.
+  - Sin descargas, sin admin, sin ventanas ocultas, sin comandos codificados.
 
 .NOTES
-  Copyright (c) 2026 pilahito - ManoSegura Source-Available License v1.0 (adaptada de CloudTerm SAL). Ver LICENSE.
+  Copyright (c) 2026 pilahito - CloudTerm Source-Available License v1.0 (adapted). See LICENSE.
 #>
 param(
-  [Parameter(Position = 0)][string]$Cmd = 'help',
-  [Parameter(Position = 1, ValueFromRemainingArguments = $true)][string[]]$Rest
+    [Parameter(Position = 0, ValueFromRemainingArguments = $true)][string[]]$Arguments = @()
 )
+
 $ErrorActionPreference = 'Stop'
-$script:Version   = '1.1.0'
-$script:Self      = $MyInvocation.MyCommand.Path
-$script:Root      = Split-Path -Parent $script:Self
-# Dot-sourcing (". .\ManoSegura.ps1") only defines the functions, for tests. Nothing on screen is touched.
-$script:IsLibrary = ($MyInvocation.InvocationName -eq '.') -or ($env:MANOSEGURA_LIBRARY -eq '1')
-$script:DryRun    = $false
-$script:JsonMode  = $false
-$script:Lang      = 'es'
+$script:Version = '2.0.0'
+$script:ScriptPath = if ($PSCommandPath) { $PSCommandPath } else { $MyInvocation.MyCommand.Path }
+$script:Root = if ($env:MANOSEGURA_ROOT) { $env:MANOSEGURA_ROOT } else { Split-Path -Parent $script:ScriptPath }
+$script:IsLibrary = ($env:MANOSEGURA_LIBRARY -eq '1') -or ($MyInvocation.InvocationName -eq '.')
+$script:DryRun = $false
+$script:AutoYes = $false
+$script:NativeReady = $false
 $script:BatchApproved = $false
-$script:MaxBatchSteps = 50
-$script:GenesisHash   = ('0' * 64)
-$script:Notes   = New-Object System.Collections.Generic.List[string]
-$script:Partial = New-Object System.Collections.Generic.List[object]
-$script:MutexPanic = 'Local\ManoSeguraPanic'
-$script:MutexState = 'Local\ManoSeguraState'
+$script:Gui = $null
+$script:Cfg = $null
+$script:Warnings = New-Object System.Collections.Generic.List[string]
+$script:ExitCode = 0
 
 # =====================================================================================================
-# 1. Mensajes bilingues / bilingual messages  (id -> @(es, en))
+# 0. Interop nativo (lazy) / native interop (lazy)
 # =====================================================================================================
-$script:Messages = @{
-  E_USAGE            = @('Uso: {0}', 'Usage: {0}')
-  E_UNKNOWN_CMD      = @('Comando desconocido: {0}. Usa: help', 'Unknown command: {0}. Use: help')
-  E_NOT_WINDOWS      = @('Este comando solo funciona en Windows.', 'This command only works on Windows.')
-  E_DISABLED         = @('ManoSegura esta DESACTIVADA (boton de panico). Solo el usuario puede reactivarla con: enable', 'ManoSegura is DISABLED (panic button). Only the user can re-enable it with: enable')
-  E_NO_TARGET        = @('No hay ventana objetivo. Usa: focus <hwnd|titulo>', 'No target window. Use: focus <hwnd|title>')
-  E_TARGET_GONE      = @('La ventana objetivo ya no existe.', 'The target window no longer exists.')
-  E_HWND_GONE        = @('Ese hwnd no existe: {0}', 'That hwnd does not exist: {0}')
-  E_AMBIGUOUS        = @('Coinciden {0} ventanas con ''{1}''. Usa el hwnd (list-windows).', '{0} windows match ''{1}''. Use the hwnd (list-windows).')
-  E_BLOCKED_WINDOW   = @('Ventana PROHIBIDA por las reglas de seguridad (login/contrasena, correo web, X, pagos, seguridad): ''{0}''', 'Window FORBIDDEN by the safety rules (login/password, webmail, X, payments, security): ''{0}''')
-  E_NOW_BLOCKED      = @('La ventana ha pasado a una pagina PROHIBIDA (''{0}''). Paro y quito el modo confianza.', 'The window switched to a FORBIDDEN page (''{0}''). Stopping and revoking trust mode.')
-  E_OFF_MONITOR      = @('La ventana ({0}) no esta entera en el monitor objetivo {1} ({2}). Muevela alli.', 'The window ({0}) is not fully on the target monitor {1} ({2}). Move it there.')
-  E_MONITOR_NOT_FOUND= @('No encuentro el monitor ''{0}'' (TargetMonitor). Usa: monitors', 'Monitor ''{0}'' not found (TargetMonitor). Use: monitors')
-  E_FOCUS_FAILED     = @('No pude traer la ventana objetivo al frente.', 'Could not bring the target window to the front.')
-  E_FOCUS_LOST       = @('La ventana objetivo perdio el foco; paro para no escribir en otra ventana.', 'The target window lost focus; stopping so nothing is typed into another window.')
-  E_FIELD_UNKNOWN    = @('No puedo comprobar el campo enfocado; no escribo.', 'Cannot inspect the focused field; not typing.')
-  E_PASSWORD_FIELD   = @('El campo enfocado es de CONTRASENA. Nunca escribo ni pego ahi.', 'The focused field is a PASSWORD field. I never type or paste there.')
-  E_ADDRESS_BAR      = @('El foco esta en la barra de direcciones del navegador. Para navegar usa: navigate <url>', 'Focus is on the browser address bar. To navigate use: navigate <url>')
-  E_KEY_BLOCKED      = @('Combinacion bloqueada: {0}', 'Blocked key combination: {0}')
-  E_KEY_WIN          = @('La tecla Windows (y Ctrl+Esc) no esta permitida.', 'The Windows key (and Ctrl+Esc) is not allowed.')
-  E_KEY_UNKNOWN      = @('Tecla desconocida: {0}', 'Unknown key: {0}')
-  E_KEY_NOKEY        = @('Combinacion sin tecla principal: {0}', 'Key combination without a main key: {0}')
-  E_KEY_TWO          = @('Combinacion con dos teclas principales: {0}', 'Key combination with two main keys: {0}')
-  E_KEY_ADDRESSBAR   = @('Atajo de barra de direcciones bloqueado en navegadores ({0}). Usa: navigate <url>', 'Address-bar shortcut blocked in browsers ({0}). Use: navigate <url>')
-  E_KEY_NEWTAB       = @('Abrir pestanas o ventanas nuevas esta bloqueado ({0}). El usuario puede activarlo con AllowNewTabs en config.json.', 'Opening new tabs or windows is blocked ({0}). The user can allow it with AllowNewTabs in config.json.')
-  E_NEW_WINDOW       = @('Se abrio una ventana nueva de navegador: {0}. Modo confianza retirado; revisa la pantalla.', 'A new browser window opened: {0}. Trust mode revoked; check the screen.')
-  E_NAV_OFF          = @('La navegacion esta desactivada (Navigation = "off" en config.json).', 'Navigation is disabled (Navigation = "off" in config.json).')
-  E_NAV_NOT_BROWSER  = @('La ventana objetivo no es un navegador.', 'The target window is not a browser.')
-  E_NAV_NO_ADDRESSBAR= @('No pude confirmar que el foco este en la barra de direcciones; no escribo la URL.', 'Could not confirm the focus is on the address bar; not typing the URL.')
-  E_URL_INVALID      = @('URL no valida: {0}', 'Invalid URL: {0}')
-  E_URL_SCHEME       = @('Solo se permiten URLs http/https: {0}', 'Only http/https URLs are allowed: {0}')
-  E_URL_CREDENTIALS  = @('URL con usuario/contrasena incrustados no permitida: {0}', 'URLs with embedded user/password are not allowed: {0}')
-  E_URL_BLOCKED      = @('URL PROHIBIDA por las reglas de seguridad (correo, X, pagos, banca, login): {0}', 'URL FORBIDDEN by the safety rules (mail, X, payments, banking, login): {0}')
-  E_URL_NOT_ALLOWED  = @('La URL no esta en UrlAllowlist: {0}', 'The URL is not in UrlAllowlist: {0}')
-  E_RATE_LIMIT       = @('Limite de velocidad: maximo {0} acciones por minuto. Espera {1} s.', 'Rate limit: at most {0} actions per minute. Wait {1} s.')
-  E_RATE_BATCH       = @('El batch tiene {0} acciones y el limite es {1} por minuto. Dividelo.', 'The batch has {0} actions and the limit is {1} per minute. Split it.')
-  E_OUT_OF_WINDOW    = @('({0},{1}) esta fuera de la ventana ({2}x{3}).', '({0},{1}) is outside the window ({2}x{3}).')
-  E_POINT_OFF_MONITOR= @('El punto ({0},{1}) no esta en el monitor objetivo.', 'Point ({0},{1}) is not on the target monitor.')
-  E_BAD_NUMBER       = @('Numero no valido: {0}', 'Invalid number: {0}')
-  E_BAD_BUTTON       = @('Boton no valido: {0} (left|right|double)', 'Invalid button: {0} (left|right|double)')
-  E_SHOT_PATH        = @('La captura debe guardarse como .png: {0}', 'Screenshots must be saved as .png: {0}')
-  E_BATCH_JSON       = @('El batch no es JSON valido: {0}', 'The batch is not valid JSON: {0}')
-  E_BATCH_EMPTY      = @('Batch vacio.', 'Empty batch.')
-  E_BATCH_TOO_LONG   = @('Maximo {0} pasos por batch (hay {1}).', 'At most {0} steps per batch (got {1}).')
-  E_BATCH_STEP       = @('Paso {0}: comando no permitido en batch: ''{1}''', 'Step {0}: command not allowed in batch: ''{1}''')
-  E_BATCH_FORMAT     = @('Paso {0}: debe ser un objeto {{"cmd":..., "args":[...]}}', 'Step {0}: must be an object {{"cmd":..., "args":[...]}}')
-  E_BATCH_ARGS       = @('Paso {0}: "args" debe ser una lista de textos o numeros.', 'Step {0}: "args" must be a list of strings or numbers.')
-  E_CONFIG_JSON      = @('config.json no es JSON valido: {0}', 'config.json is not valid JSON: {0}')
-  E_CONFIG_VALUE     = @('config.json: valor no valido para {0}: ''{1}''', 'config.json: invalid value for {0}: ''{1}''')
-  E_CONFIG_RANGE     = @('config.json: {0} = {1} fuera de rango ({2}..{3}).', 'config.json: {0} = {1} out of range ({2}..{3}).')
-  E_GUARD            = @('No pude arrancar el vigilante de panico (Ctrl+Alt+P), asi que no actuo. Revisa la instalacion (Unblock-File / RemoteSigned, ver README).', 'Could not start the panic guard (Ctrl+Alt+P), so I will not act. Check the install (Unblock-File / RemoteSigned, see README).')
-  E_CANCELLED        = @('CANCELADO por el usuario: {0}', 'CANCELLED by the user: {0}')
-  E_AUDIT_BROKEN     = @('REGISTRO DE AUDITORIA ALTERADO en la linea {0} ({1}).', 'AUDIT LOG TAMPERED at line {0} ({1}).')
-  E_INTERNAL         = @('Error interno: {0}', 'Internal error: {0}')
+$script:NativeCode = @'
+using System;
+using System.Text;
+using System.Runtime.InteropServices;
+
+namespace ManoNative {
+    [StructLayout(LayoutKind.Sequential)]
+    public struct RECT { public int Left; public int Top; public int Right; public int Bottom; }
+
+    [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+    public struct DISPLAY_DEVICE {
+        public int cb;
+        [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 32)] public string DeviceName;
+        [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 128)] public string DeviceString;
+        public int StateFlags;
+        [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 128)] public string DeviceID;
+        [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 128)] public string DeviceKey;
+    }
+
+    public static class Win {
+        [DllImport("user32.dll")] public static extern bool SetProcessDPIAware();
+        public delegate bool EnumProc(IntPtr hWnd, IntPtr lParam);
+        [DllImport("user32.dll")] public static extern bool EnumWindows(EnumProc cb, IntPtr lParam);
+        [DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr hWnd);
+        [DllImport("user32.dll")] public static extern bool IsWindow(IntPtr hWnd);
+        [DllImport("user32.dll")] public static extern bool IsIconic(IntPtr hWnd);
+        [DllImport("user32.dll", CharSet = CharSet.Unicode)] public static extern int GetWindowText(IntPtr hWnd, StringBuilder s, int n);
+        [DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint pid);
+        [DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr hWnd, IntPtr pid);
+        [DllImport("kernel32.dll")] public static extern uint GetCurrentThreadId();
+        [DllImport("user32.dll")] public static extern bool AttachThreadInput(uint a, uint b, bool attach);
+        [DllImport("user32.dll")] public static extern bool GetWindowRect(IntPtr hWnd, out RECT r);
+        [DllImport("dwmapi.dll")] public static extern int DwmGetWindowAttribute(IntPtr hWnd, int attr, out RECT r, int size);
+        [DllImport("dwmapi.dll")] public static extern int DwmSetWindowAttribute(IntPtr hWnd, int attr, ref int value, int size);
+        [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr hWnd);
+        [DllImport("user32.dll")] public static extern bool BringWindowToTop(IntPtr hWnd);
+        [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
+        [DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr hWnd, int cmd);
+        [DllImport("user32.dll")] public static extern bool SetCursorPos(int x, int y);
+        [DllImport("user32.dll")] public static extern void mouse_event(uint flags, int dx, int dy, int data, IntPtr extra);
+        [DllImport("user32.dll")] public static extern void keybd_event(byte vk, byte scan, uint flags, IntPtr extra);
+        [DllImport("user32.dll")] public static extern bool RegisterHotKey(IntPtr hWnd, int id, uint modifiers, uint vk);
+        [DllImport("user32.dll")] public static extern bool UnregisterHotKey(IntPtr hWnd, int id);
+        [DllImport("user32.dll")] public static extern bool PrintWindow(IntPtr hWnd, IntPtr hdc, uint flags);
+        [DllImport("user32.dll", CharSet = CharSet.Unicode)] public static extern bool EnumDisplayDevices(string device, uint index, ref DISPLAY_DEVICE dd, uint flags);
+    }
+}
+'@
+
+$script:FormCode = @'
+using System;
+using System.Windows.Forms;
+
+namespace ManoForms {
+    public class NoActivateForm : Form {
+        protected override bool ShowWithoutActivation { get { return true; } }
+        protected override CreateParams CreateParams {
+            get {
+                CreateParams cp = base.CreateParams;
+                cp.ExStyle |= 0x08000000; // WS_EX_NOACTIVATE
+                cp.ExStyle |= 0x00000080; // WS_EX_TOOLWINDOW
+                return cp;
+            }
+        }
+    }
+
+    public class HotkeyWindow : NativeWindow {
+        public event EventHandler Hotkey;
+        public HotkeyWindow(IntPtr handle) { AssignHandle(handle); }
+        protected override void WndProc(ref Message m) {
+            if (m.Msg == 0x0312) {
+                EventHandler handler = Hotkey;
+                if (handler != null) { handler(this, EventArgs.Empty); }
+            }
+            base.WndProc(ref m);
+        }
+    }
+}
+'@
+
+function Ensure-ManoNative {
+    if ($script:NativeReady) { return }
+    if (-not ('ManoNative.Win' -as [type])) {
+        Add-Type -AssemblyName System.Windows.Forms, System.Drawing, UIAutomationClient, UIAutomationTypes -ErrorAction SilentlyContinue
+        Add-Type -TypeDefinition $script:NativeCode
+    }
+    if (-not ('ManoForms.NoActivateForm' -as [type])) {
+        Add-Type -TypeDefinition $script:FormCode -ReferencedAssemblies @('System.Windows.Forms', 'System.Drawing')
+    }
+    try { [void][ManoNative.Win]::SetProcessDPIAware() } catch { }
+    $script:NativeReady = $true
 }
 
+# =====================================================================================================
+# 1. Errores, avisos y registro / errors, warnings and logging
+# =====================================================================================================
 class ManoError : System.Exception {
-  [string]$Id; [int]$Code; [string]$Es; [string]$En
-  ManoError([string]$id, [int]$code, [string]$es, [string]$en) : base($es) { $this.Id = $id; $this.Code = $code; $this.Es = $es; $this.En = $en }
-}
-
-function Get-ManoText {
-  param([string]$Id, [object[]]$Arguments = @())
-  $pair = $script:Messages[$Id]
-  if (-not $pair) { $pair = @($Id, $Id) }
-  $fa = @($Arguments)
-  [pscustomobject]@{ Id = $Id; Es = ($pair[0] -f $fa); En = ($pair[1] -f $fa) }
-}
-
-# Returns the exception; use as:  throw (Get-ManoError 'E_X' @(args))
-# Exit codes: 2 = refused/error, 3 = cancelled by the user, 4 = rate limited (wait and retry).
-function Get-ManoError {
-  param([string]$Id, [object[]]$Arguments = @(), [int]$Code = 0)
-  if (-not $Code) { $Code = switch ($Id) { 'E_CANCELLED' { 3 } 'E_RATE_LIMIT' { 4 } default { 2 } } }
-  $t = Get-ManoText $Id $Arguments
-  [ManoError]::new($Id, $Code, $t.Es, $t.En)
-}
-
-function Select-ManoLanguage {
-  param($Text)
-  switch ($script:Lang) { 'en' { $Text.En } 'both' { "$($Text.Es) / $($Text.En)" } default { $Text.Es } }
-}
-
-# =====================================================================================================
-# 2. Logica pura (testeable en cualquier SO) / pure logic (testable on any OS)
-# =====================================================================================================
-function ConvertFrom-ManoArgument {
-  param([string[]]$Arguments)
-  $list = New-Object System.Collections.Generic.List[string]
-  $flags = [ordered]@{ DryRun = $false; Json = $false; Lang = ''; Rest = @() }
-  foreach ($a in @($Arguments)) {
-    if ($null -eq $a) { continue }
-    switch -Exact ($a) {
-      '--dry-run' { $flags.DryRun = $true }
-      '--json'    { $flags.Json = $true }
-      '--en'      { $flags.Lang = 'en' }
-      '--es'      { $flags.Lang = 'es' }
-      default     { $list.Add($a) }
-    }
-  }
-  $flags.Rest = $list.ToArray()
-  [pscustomobject]$flags
-}
-
-function Get-ManoClipped {
-  param([string]$Text, [int]$Max = 200)
-  if ($null -eq $Text) { return '' }
-  if ($Text.Length -gt $Max) { $Text.Substring(0, $Max) + '...' } else { $Text }
-}
-
-# ---------- config ----------
-$script:ConfigDefaults = [ordered]@{
-  TargetMonitor       = 'primary'
-  ShotsDir            = ''
-  ConfirmTimeoutSec   = 20
-  TrustMaxMinutes     = 60
-  ExtraBlockedTitles  = @()
-  Language            = 'es'
-  Navigation          = 'off'
-  UrlAllowlist        = @()
-  ExtraBlockedUrls    = @()
-  AllowNewTabs        = $false
-  MaxActionsPerMinute = 60
-  Overlay             = $true
-  GuardIdleMinutes    = 30
-  ExtraBrowsers       = @()
-}
-# Hard ceilings: config can make things stricter, never looser than these.
-$script:ConfigRanges  = @{ ConfirmTimeoutSec = @(5, 300); TrustMaxMinutes = @(1, 240); MaxActionsPerMinute = @(1, 300); GuardIdleMinutes = @(1, 1440) }
-$script:ConfigChoices = @{ Language = @('es', 'en', 'both'); Navigation = @('off', 'allowlist', 'ask') }
-
-function ConvertTo-ManoConfigValue {
-  param([string]$Key, $Value)
-  $def = $script:ConfigDefaults[$Key]
-  if ($def -is [bool]) {
-    if ($Value -is [bool]) { return $Value }
-    $s = "$Value".Trim().ToLowerInvariant()
-    if ($s -in @('true', '1', 'yes', 'si')) { return $true }
-    if ($s -in @('false', '0', 'no')) { return $false }
-    throw (Get-ManoError 'E_CONFIG_VALUE' @($Key, $Value))
-  }
-  if ($def -is [int]) {
-    $n = 0
-    if ($Value -is [bool] -or -not [int]::TryParse("$Value", [ref]$n)) { throw (Get-ManoError 'E_CONFIG_VALUE' @($Key, $Value)) }
-    $rg = $script:ConfigRanges[$Key]
-    if ($rg -and ($n -lt $rg[0] -or $n -gt $rg[1])) { throw (Get-ManoError 'E_CONFIG_RANGE' @($Key, $n, $rg[0], $rg[1])) }
-    return $n
-  }
-  if ($def -is [array]) {
-    $out = @(@($Value) | Where-Object { $null -ne $_ -and "$_".Trim() -ne '' } | ForEach-Object { "$_".Trim() })
-    return , $out
-  }
-  $s = "$Value".Trim()
-  $choices = $script:ConfigChoices[$Key]
-  if ($choices) {
-    $s = $s.ToLowerInvariant()
-    if ($s -notin $choices) { throw (Get-ManoError 'E_CONFIG_VALUE' @($Key, $Value)) }
-  }
-  $s
-}
-
-function Import-ManoConfig {
-  param([string]$Path, [string]$MonitorOverride, [string]$LanguageOverride)
-  $cfg = [ordered]@{}
-  foreach ($k in $script:ConfigDefaults.Keys) { $cfg[$k] = $script:ConfigDefaults[$k] }
-  if ($Path -and (Test-Path -LiteralPath $Path)) {
-    $raw = Get-Content -LiteralPath $Path -Raw -Encoding UTF8
-    if ($raw -and $raw.Trim()) {
-      try { $j = $raw | ConvertFrom-Json } catch { throw (Get-ManoError 'E_CONFIG_JSON' @($_.Exception.Message)) }
-      if ($j -isnot [pscustomobject]) { throw (Get-ManoError 'E_CONFIG_JSON' @('se esperaba un objeto { } / expected an object { }')) }
-      foreach ($k in @($script:ConfigDefaults.Keys)) {
-        $p = $j.PSObject.Properties[$k]
-        if ($null -eq $p) { continue }
-        $v = $p.Value
-        if ($null -eq $v -or ($v -is [string] -and $v.Trim() -eq '')) { continue }
-        $cfg[$k] = ConvertTo-ManoConfigValue $k $v
-      }
-    }
-  }
-  if ($MonitorOverride) { $cfg.TargetMonitor = $MonitorOverride }
-  if ($LanguageOverride) { $cfg.Language = ConvertTo-ManoConfigValue 'Language' $LanguageOverride }
-  $cfg
-}
-
-# ---------- HARD title rules (cannot be disabled by config or trust mode; config can only ADD) ----------
-# v1.0 rules, unchanged: login/password, Gmail/webmail, X/Twitter, payments/banking.
-$script:BlockedTitleCore = '\blog ?in\b|\bsign ?in\b|\bsign ?up\b|iniciar sesi|inicio de sesi|acceder a tu cuenta|contrase|password|passwort|\b2fa\b|verificaci.n en dos|one-time code|' +
-  'gmail|mail\.google|inbox \(|bandeja de entrada|outlook\.live|' +
-  '\(\d+\) x$| / x$| on x:| en x:|\bx\.com\b|twitter|' +
-  'paypal|stripe|checkout|\bpago\b|\bpagar\b|payment|\bpay\b|billing|facturaci|tarjeta|credit card|\bbank|\bbanco|banca online|bizum|transferencia|wallet|cartera|coinbase|binance|crypto|cripto'
-# v1.1 additions: more webmail, password managers, more payments, security/antivirus UIs, ManoSegura's own windows.
-$script:BlockedTitleAdded = 'proton ?mail|yahoo mail|mail\.yahoo|tuta ?mail|tutanota|outlook\.office|tweetdeck|' +
-  'bitwarden|1password|keepass|lastpass|dashlane|nordpass|' +
-  'revolut|klarna|\biban\b|' +
-  'kaspersky|windows defender|microsoft defender|seguridad de windows|windows security|control de cuentas de usuario|user account control|' +
-  '^manosegura( -|$)'
-
-function Get-ManoBlockedTitleRegex {
-  param([string[]]$Extra)
-  $parts = @($script:BlockedTitleCore, $script:BlockedTitleAdded)
-  $ex = @(@($Extra) | Where-Object { $_ } | ForEach-Object { [regex]::Escape("$_") })
-  if ($ex.Count) { $parts += ($ex -join '|') }
-  '(?i)(' + ($parts -join '|') + ')'
-}
-
-function Test-ManoBlockedTitle {
-  param([string]$Title, [string[]]$Extra)
-  if (-not $Title) { return $false }
-  [bool]([regex]::IsMatch($Title, (Get-ManoBlockedTitleRegex $Extra)))
-}
-
-# ---------- URL rules ----------
-$script:BlockedHostRegex = '(?i)(' +
-  '(^|\.)(gmail|paypal|stripe|coinbase|binance|kraken|revolut|klarna|bizum|protonmail|proton|tutanota|tuta|twitter|tweetdeck|bitwarden|1password|lastpass|dashlane|' +
-  'caixabank|santander|bbva|ing|sabadell|bankinter|unicaja|kutxabank|ibercaja|abanca|openbank|evobanco|cajamar)\.[a-z.]+$|' +
-  '(^|\.)(mail\.google|accounts\.google|pay\.google|outlook\.live|outlook\.office|outlook\.office365|mail\.yahoo|login\.yahoo|login\.microsoftonline|login\.live|account\.microsoft|appleid\.apple)\.com$|' +
-  '(^|\.)x\.com$|(^|\.)t\.co$|' +
-  '^(login|signin|sso|auth|accounts?|secure|banking|pay|payments?|checkout|billing|wallet|mail|webmail|correo)\.|' +
-  'bank|banco)'
-$script:BlockedPathRegex = '(?i)(^|/)(login|log-in|signin|sign-in|signup|sign-up|auth|oauth2?|sso|password|passwd|reset-password|checkout|payment|payments|pay|billing|wallet|2fa|mfa)(/|$|\.)'
-
-function Test-ManoUrlInList {
-  param([uri]$Uri, [string[]]$List)
-  $hn = $Uri.DnsSafeHost.ToLowerInvariant()
-  foreach ($e in @($List)) {
-    $e = "$e".Trim()
-    if (-not $e) { continue }
-    if ($e -match '^(?i)https?://') {
-      $abs = $Uri.AbsoluteUri
-      if ($abs.StartsWith($e, [StringComparison]::OrdinalIgnoreCase)) {
-        if ($e.EndsWith('/') -or $abs.Length -eq $e.Length -or ($abs[$e.Length] -in @([char]'/', [char]'?', [char]'#'))) { return $true }
-      }
-      continue
-    }
-    $pat = $e.ToLowerInvariant().TrimStart('*').TrimStart('.')
-    if ($pat -and ($hn -eq $pat -or $hn.EndsWith('.' + $pat))) { return $true }
-  }
-  $false
-}
-
-# Pure: decides if "navigate <url>" may run. Returns an object; never throws.
-function Test-ManoUrl {
-  param([string]$Url, [string]$Mode = 'ask', [string[]]$Allowlist, [string[]]$ExtraBlocked)
-  $r = [ordered]@{ Ok = $false; Id = ''; Url = $Url; Normalized = ''; Host = ''; InAllowlist = $false; NeedsExplicitConfirm = $true }
-  if ($Mode -eq 'off') { $r.Id = 'E_NAV_OFF'; return [pscustomobject]$r }
-  $u = "$Url".Trim()
-  if (-not $u -or $u -match '[\s\x00-\x1f\x7f]') { $r.Id = 'E_URL_INVALID'; return [pscustomobject]$r }
-  if ($u -notmatch '^[a-zA-Z][a-zA-Z0-9+.\-]*:' -and $u -match '^[^/\\]+\.[^/\\]+') { $u = 'https://' + $u }
-  $uri = $null
-  if (-not [uri]::TryCreate($u, [UriKind]::Absolute, [ref]$uri)) { $r.Id = 'E_URL_INVALID'; return [pscustomobject]$r }
-  if ($uri.Scheme -notin @('http', 'https')) { $r.Id = 'E_URL_SCHEME'; return [pscustomobject]$r }
-  if ($uri.UserInfo) { $r.Id = 'E_URL_CREDENTIALS'; return [pscustomobject]$r }
-  $hn = $uri.DnsSafeHost.ToLowerInvariant()
-  $r.Host = $hn; $r.Normalized = $uri.AbsoluteUri
-  if (-not $hn) { $r.Id = 'E_URL_INVALID'; return [pscustomobject]$r }
-  $blocked = [regex]::IsMatch($hn, $script:BlockedHostRegex) -or [regex]::IsMatch($uri.AbsolutePath, $script:BlockedPathRegex)
-  foreach ($x in @($ExtraBlocked)) { if ($x -and $uri.AbsoluteUri.IndexOf("$x", [StringComparison]::OrdinalIgnoreCase) -ge 0) { $blocked = $true } }
-  if ($blocked) { $r.Id = 'E_URL_BLOCKED'; return [pscustomobject]$r }
-  $r.InAllowlist = Test-ManoUrlInList $uri $Allowlist
-  if ($Mode -eq 'allowlist' -and -not $r.InAllowlist) { $r.Id = 'E_URL_NOT_ALLOWED'; return [pscustomobject]$r }
-  $r.Ok = $true
-  $r.NeedsExplicitConfirm = -not $r.InAllowlist
-  [pscustomobject]$r
-}
-
-# ---------- browsers ----------
-$script:BrowserNames = @('chrome', 'msedge', 'brave', 'firefox', 'opera', 'vivaldi', 'iexplore', 'chromium', 'waterfox', 'librewolf',
-  'thorium', 'browser', 'arc', 'zen', 'floorp', 'palemoon', 'seamonkey', 'maxthon', 'duckduckgo', 'yandex', 'whale', 'epic', 'slimjet', 'ucbrowser')
-
-function Test-ManoBrowser {
-  param([string]$ProcessName, [string[]]$Extra)
-  if (-not $ProcessName) { return $false }
-  $n = ($ProcessName -replace '(?i)\.exe$', '').ToLowerInvariant()
-  $all = @($script:BrowserNames) + @(@($Extra) | Where-Object { $_ } | ForEach-Object { ("$_" -replace '(?i)\.exe$', '').ToLowerInvariant() })
-  $n -in $all
-}
-
-# Chromium omnibox / Firefox urlbar, by locale-independent ids first, then by localized names.
-function Test-ManoAddressBarElement {
-  param([string]$Name, [string]$AutomationId, [string]$ClassName)
-  if ($ClassName -match '(?i)OmniboxView|LocationBar|AddressBar') { return $true }
-  if ($AutomationId -match '(?i)urlbar|addressbar|omnibox|address_bar') { return $true }
-  [bool]($Name -match '(?i)(address and search bar|barra de direcciones|search or enter (web )?address|buscar o (escribir|introducir)|introduce (una )?direcci|escribe (una )?direcci|enter address|direcci.n web)')
-}
-
-# ---------- keys ----------
-$script:KeyAlias = @{ escape = 'esc'; supr = 'delete'; del = 'delete'; ins = 'insert'; intro = 'enter'; return = 'enter'; pgup = 'pageup'; pgdn = 'pagedown'; espacio = 'space'; bksp = 'backspace' }
-$script:KeySendMap = @{ enter = '{ENTER}'; tab = '{TAB}'; esc = '{ESC}'; backspace = '{BACKSPACE}'; delete = '{DELETE}'; insert = '{INSERT}'; up = '{UP}'; down = '{DOWN}'
-  left = '{LEFT}'; right = '{RIGHT}'; home = '{HOME}'; end = '{END}'; pageup = '{PGUP}'; pagedown = '{PGDN}'; space = ' ' }
-1..12 | ForEach-Object { $script:KeySendMap["f$_"] = "{F$_}" }
-$script:ComboAddressBar   = @('ctrl+l', 'alt+d', 'f6', 'shift+f6', 'ctrl+e', 'ctrl+k', 'alt+home')
-$script:ComboNewTab       = @('ctrl+t', 'ctrl+n', 'ctrl+shift+n', 'ctrl+shift+t', 'ctrl+shift+p', 'alt+enter', 'ctrl+shift+enter')
-$script:ComboWindowSwitch = @('alt+tab', 'alt+shift+tab', 'ctrl+alt+tab', 'alt+esc', 'alt+shift+esc')
-
-function ConvertTo-ManoCombo {
-  param([string]$Combo)
-  $c = ("$Combo" -replace '\s', '').ToLowerInvariant()
-  if (-not $c) { throw (Get-ManoError 'E_KEY_NOKEY' @($Combo)) }
-  if ($c -eq '+') { $parts = @('+') }
-  elseif ($c.EndsWith('++')) { $parts = @($c.Substring(0, $c.Length - 2) -split '\+') + @('+') }
-  else { $parts = @($c -split '\+') }
-  $mods = New-Object System.Collections.Generic.List[string]; $key = ''
-  foreach ($p in $parts) {
-    if ($p -eq '') { continue }
-    $m = switch ($p) { { $_ -in 'ctrl', 'control', 'ctl' } { 'ctrl' } { $_ -in 'shift', 'mayus' } { 'shift' } 'alt' { 'alt' } default { '' } }
-    if ($m) { if (-not $mods.Contains($m)) { $mods.Add($m) }; continue }
-    if ($p -in @('win', 'windows', 'super', 'meta', 'lwin', 'rwin', 'cmd')) { throw (Get-ManoError 'E_KEY_WIN') }
-    $k = if ($script:KeyAlias.ContainsKey($p)) { $script:KeyAlias[$p] } else { $p }
-    if (-not ($script:KeySendMap.ContainsKey($k) -or $k.Length -eq 1)) { throw (Get-ManoError 'E_KEY_UNKNOWN' @($p)) }
-    if ($key) { throw (Get-ManoError 'E_KEY_TWO' @($Combo)) }
-    $key = $k
-  }
-  if (-not $key) { throw (Get-ManoError 'E_KEY_NOKEY' @($Combo)) }
-  $ordered = @(@('ctrl', 'alt', 'shift') | Where-Object { $mods.Contains($_) })
-  [pscustomobject]@{ Mods = [string[]]$ordered; Key = $key; Normalized = ((@($ordered) + @($key)) -join '+') }
-}
-
-# Pure: $null if allowed, else @{ Id; Arg }.
-function Get-ManoComboBlock {
-  param($Parts, [bool]$IsBrowser, [bool]$AllowNewTabs)
-  $m = @($Parts.Mods); $k = $Parts.Key; $n = $Parts.Normalized
-  if ($m -contains 'alt' -and $k -eq 'f4') { return @{ Id = 'E_KEY_BLOCKED'; Arg = $n } }
-  if ($m -contains 'ctrl' -and $m -contains 'alt' -and $k -eq 'delete') { return @{ Id = 'E_KEY_BLOCKED'; Arg = $n } }
-  if ($m -contains 'ctrl' -and $m -contains 'shift' -and $k -eq 'esc') { return @{ Id = 'E_KEY_BLOCKED'; Arg = $n } }
-  if ($n -eq 'ctrl+esc') { return @{ Id = 'E_KEY_WIN'; Arg = $n } }
-  if ($n -in $script:ComboWindowSwitch) { return @{ Id = 'E_KEY_BLOCKED'; Arg = $n } }
-  if ($IsBrowser) {
-    if ($n -in $script:ComboAddressBar) { return @{ Id = 'E_KEY_ADDRESSBAR'; Arg = $n } }
-    if (-not $AllowNewTabs -and $n -in $script:ComboNewTab) { return @{ Id = 'E_KEY_NEWTAB'; Arg = $n } }
-  }
-  $null
-}
-
-function ConvertTo-ManoSendKey {
-  param($Parts)
-  $mods = ''
-  foreach ($m in @($Parts.Mods)) { $mods += switch ($m) { 'ctrl' { '^' } 'alt' { '%' } 'shift' { '+' } } }
-  $k = $Parts.Key
-  $kp = if ($script:KeySendMap.ContainsKey($k)) { $script:KeySendMap[$k] } else { ($k -replace '([+^%~(){}\[\]])', '{$1}') }
-  "$mods$kp"
-}
-
-function ConvertTo-ManoSendKeyText {
-  param([string]$Text)
-  (($Text -replace '([+^%~(){}\[\]])', '{$1}') -replace "`r?`n", '{ENTER}') -replace "`t", '{TAB}'
-}
-
-# ---------- monitors / geometry (Bounds need X, Y, Width, Height) ----------
-function Test-ManoPointInside {
-  param([int]$X, [int]$Y, $Rect)
-  ($X -ge $Rect.X) -and ($Y -ge $Rect.Y) -and ($X -lt ($Rect.X + $Rect.Width)) -and ($Y -lt ($Rect.Y + $Rect.Height))
-}
-
-function Test-ManoRectInside {
-  param($Inner, $Outer)
-  ($Inner.X -ge $Outer.X) -and ($Inner.Y -ge $Outer.Y) -and (($Inner.X + $Inner.Width) -le ($Outer.X + $Outer.Width)) -and (($Inner.Y + $Inner.Height) -le ($Outer.Y + $Outer.Height))
-}
-
-function Format-ManoRect {
-  param($Rect)
-  "$($Rect.X),$($Rect.Y) $($Rect.Width)x$($Rect.Height)"
-}
-
-# Spec: primary | <index> | left/izquierda | right/derecha | x=-1920 | -1920 | -1920,0 (a point) | \\.\DISPLAY2 | DISPLAY2 | part of the monitor id (ACR, DEL...)
-function Select-ManoMonitor {
-  param([object[]]$Monitors, [string]$Spec)
-  $all = @($Monitors)
-  if (-not $all.Count) { return $null }
-  $s = "$Spec".Trim()
-  if (-not $s -or $s -in @('primary', 'primario', 'principal')) { return ($all | Where-Object { $_.Primary } | Select-Object -First 1) }
-  if ($s -match '^\d+$') { $i = [int]$s; if ($i -lt $all.Count) { return $all[$i] }; return $null }
-  if ($s -match '^(?i)(left|izquierda|izq)$') { return ($all | Sort-Object -Property { $_.Bounds.X } | Select-Object -First 1) }
-  if ($s -match '^(?i)(right|derecha|der)$') { return ($all | Sort-Object -Property { $_.Bounds.X } -Descending | Select-Object -First 1) }
-  if ($s -match '^(?i)(?:x=)?(-?\d+)\s*,\s*(-?\d+)$') {
-    $px = [int]$Matches[1]; $py = [int]$Matches[2]
-    return ($all | Where-Object { Test-ManoPointInside $px $py $_.Bounds } | Select-Object -First 1)
-  }
-  if ($s -match '^(?i)x=(-?\d+)$' -or $s -match '^(-\d+)$') {
-    $px = [int]$Matches[1]
-    return ($all | Where-Object { $_.Bounds.X -eq $px } | Select-Object -First 1)
-  }
-  $m = @($all | Where-Object { $_.DeviceName -eq $s -or $_.DeviceName -like "*\$s" })
-  if ($m.Count) { return $m[0] }
-  $m = @($all | Where-Object { $_.MonitorId -and $_.MonitorId.IndexOf($s, [StringComparison]::OrdinalIgnoreCase) -ge 0 })
-  if ($m.Count) { return $m[0] }
-  $null
-}
-
-# Border rectangles around a window: outside it when there is room on the monitor, otherwise just inside.
-function Get-ManoOverlayEdge {
-  param($Window, $Monitor, [int]$Thickness = 3)
-  $t = [math]::Max(1, $Thickness)
-  $wr = $Window.X + $Window.Width; $wb = $Window.Y + $Window.Height
-  $mr = $Monitor.X + $Monitor.Width; $mb = $Monitor.Y + $Monitor.Height
-  $l  = if ($Window.X - $t -ge $Monitor.X) { $Window.X - $t } else { $Window.X }
-  $rx = if ($wr + $t -le $mr) { $wr } else { $wr - $t }
-  $tp = if ($Window.Y - $t -ge $Monitor.Y) { $Window.Y - $t } else { $Window.Y }
-  $bt = if ($wb + $t -le $mb) { $wb } else { $wb - $t }
-  $w = $rx + $t - $l; $h = $bt + $t - $tp
-  @(
-    [pscustomobject]@{ Side = 'top';    X = $l;  Y = $tp; Width = $w; Height = $t }
-    [pscustomobject]@{ Side = 'bottom'; X = $l;  Y = $bt; Width = $w; Height = $t }
-    [pscustomobject]@{ Side = 'left';   X = $l;  Y = $tp; Width = $t; Height = $h }
-    [pscustomobject]@{ Side = 'right';  X = $rx; Y = $tp; Width = $t; Height = $h }
-  )
-}
-
-# ---------- trust / rate limit ----------
-function Get-ManoTrustExpiry {
-  param([string]$Text)
-  $t = [datetime]::MinValue
-  if (-not [datetime]::TryParse("$Text".Trim(), [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::RoundtripKind, [ref]$t)) { return $null }
-  $t.ToLocalTime()
-}
-
-function Test-ManoTrustValue {
-  param([string]$Text, [datetime]$Now, [int]$MaxMinutes)
-  $t = Get-ManoTrustExpiry $Text
-  if ($null -eq $t) { return $false }
-  # A trust file further in the future than the allowed maximum was not written by the dialog: ignore it.
-  ($t -gt $Now) -and ($t -le $Now.AddMinutes($MaxMinutes + 1))
-}
-
-function Test-ManoRateLimit {
-  param([datetime[]]$History, [datetime]$Now, [int]$Max, [int]$Count = 1, [int]$WindowSec = 60)
-  $from = $Now.AddSeconds(-$WindowSec); $until = $Now.AddSeconds(5)
-  $recent = @(@($History) | Where-Object { $_ -gt $from -and $_ -le $until } | Sort-Object)
-  $res = [ordered]@{ Allowed = $true; RetryAfterSec = 0; NeverFits = $false; Recent = $recent }
-  if ($Count -gt $Max) { $res.Allowed = $false; $res.NeverFits = $true; $res.RetryAfterSec = $WindowSec; return [pscustomobject]$res }
-  if ($recent.Count + $Count -le $Max) { return [pscustomobject]$res }
-  $k = $recent.Count + $Count - $Max
-  $free = $recent[$k - 1].AddSeconds($WindowSec)
-  $res.Allowed = $false
-  $res.RetryAfterSec = [int][math]::Max(1, [math]::Ceiling(($free - $Now).TotalSeconds))
-  [pscustomobject]$res
-}
-
-# ---------- audit log with hash chain ----------
-function Get-ManoSha256 {
-  param([string]$Text)
-  $sha = [Security.Cryptography.SHA256]::Create()
-  try { $b = $sha.ComputeHash([Text.Encoding]::UTF8.GetBytes("$Text")) } finally { $sha.Dispose() }
-  -join ($b | ForEach-Object { $_.ToString('x2') })
-}
-
-function Get-ManoAuditPayload {
-  param([string]$Seq, [string]$Time, [string]$ProcessId, [string]$EventName, [string]$Detail, [string]$Prev)
-  "manosegura-audit-v1`n$Seq`n$Time`n$ProcessId`n$EventName`n$Detail`n$Prev"
-}
-
-function Get-ManoAuditRecord {
-  param([long]$Seq, [string]$Prev, [string]$EventName, [string]$Detail, [string]$Time, [int]$ProcessId)
-  $ev = ("$EventName" -replace "[`r`n]+", ' ')
-  $d  = Get-ManoClipped ("$Detail" -replace "`r?`n", ' | ') 1000
-  $hash = Get-ManoSha256 (Get-ManoAuditPayload "$Seq" $Time "$ProcessId" $ev $d $Prev)
-  [ordered]@{ seq = $Seq; time = $Time; pid = $ProcessId; event = $ev; detail = $d; prev = $Prev; hash = $hash }
-}
-
-function Test-ManoAuditChain {
-  param([string[]]$Lines, [string]$HeadHash)
-  $prev = $script:GenesisHash; $expect = 1; $n = 0; $count = 0
-  foreach ($line in @($Lines)) {
-    $n++
-    if (-not "$line".Trim()) { continue }
-    try { $o = $line | ConvertFrom-Json } catch { return [pscustomobject]@{ Ok = $false; Count = $count; BrokenAt = $n; Reason = 'json' } }
-    if ("$($o.seq)" -ne "$expect") { return [pscustomobject]@{ Ok = $false; Count = $count; BrokenAt = $n; Reason = 'seq' } }
-    if ("$($o.prev)" -ne $prev)    { return [pscustomobject]@{ Ok = $false; Count = $count; BrokenAt = $n; Reason = 'prev' } }
-    $calc = Get-ManoSha256 (Get-ManoAuditPayload "$($o.seq)" "$($o.time)" "$($o.pid)" "$($o.event)" "$($o.detail)" "$($o.prev)")
-    if ($calc -ne "$($o.hash)") { return [pscustomobject]@{ Ok = $false; Count = $count; BrokenAt = $n; Reason = 'hash' } }
-    $prev = $calc; $expect++; $count++
-  }
-  if ($HeadHash -and $HeadHash -ne $prev) { return [pscustomobject]@{ Ok = $false; Count = $count; BrokenAt = $n; Reason = 'head' } }
-  [pscustomobject]@{ Ok = $true; Count = $count; BrokenAt = 0; Reason = '' }
-}
-
-# ---------- batch ----------
-$script:BatchCommands = @('focus', 'screenshot', 'click', 'type', 'paste', 'key', 'scroll', 'wait', 'navigate')
-
-function ConvertFrom-ManoBatch {
-  param([string]$Json, [int]$MaxSteps = 50)
-  try { $obj = $Json | ConvertFrom-Json } catch { throw (Get-ManoError 'E_BATCH_JSON' @($_.Exception.Message)) }
-  if ($null -eq $obj) { throw (Get-ManoError 'E_BATCH_EMPTY') }
-  if ($obj -is [array]) { $steps = @($obj) }
-  elseif ($obj -is [pscustomobject] -and $obj.PSObject.Properties['steps']) { $steps = @($obj.steps) }
-  else { $steps = @($obj) }
-  $steps = @($steps | Where-Object { $null -ne $_ })
-  if (-not $steps.Count) { throw (Get-ManoError 'E_BATCH_EMPTY') }
-  if ($steps.Count -gt $MaxSteps) { throw (Get-ManoError 'E_BATCH_TOO_LONG' @($MaxSteps, $steps.Count)) }
-  $i = 0
-  foreach ($s in $steps) {
-    $i++
-    if ($s -isnot [pscustomobject] -or -not $s.PSObject.Properties['cmd']) { throw (Get-ManoError 'E_BATCH_FORMAT' @($i)) }
-    $c = "$($s.cmd)".Trim().ToLowerInvariant()
-    if ($c -notin $script:BatchCommands) { throw (Get-ManoError 'E_BATCH_STEP' @($i, $c)) }
-    $av = New-Object System.Collections.Generic.List[string]
-    $ap = $s.PSObject.Properties['args']
-    if ($ap -and $null -ne $ap.Value) {
-      foreach ($x in @($ap.Value)) {
-        if ($x -is [string] -or $x -is [ValueType]) { $av.Add([string]$x) } else { throw (Get-ManoError 'E_BATCH_ARGS' @($i)) }
-      }
-    }
-    [pscustomobject]@{ Index = $i; Cmd = $c; Args = [string[]]$av.ToArray() }
-  }
-}
-
-function Read-ManoBatchSource {
-  param([string]$Source)
-  if ($Source -eq '-') { return [Console]::In.ReadToEnd() }
-  $t = $Source.TrimStart()
-  if ($t.StartsWith('{') -or $t.StartsWith('[')) { return $Source }
-  if (Test-Path -LiteralPath $Source -PathType Leaf) { return (Get-Content -LiteralPath $Source -Raw -Encoding UTF8) }
-  $Source
-}
-
-function Get-ManoActionCount {
-  param([object[]]$Steps)
-  @(@($Steps) | Where-Object { $_.Cmd -notin @('wait', 'screenshot') }).Count
-}
-
-function Get-ManoInt {
-  param([string]$Text)
-  $n = 0
-  if (-not [int]::TryParse("$Text", [Globalization.NumberStyles]::Integer, [Globalization.CultureInfo]::InvariantCulture, [ref]$n)) { throw (Get-ManoError 'E_BAD_NUMBER' @($Text)) }
-  $n
-}
-
-# ---------- output ----------
-# JSON with every non-ASCII char escaped (\uXXXX), so it survives any console code page.
-function ConvertTo-ManoJson {
-  param($InputObject)
-  $j = ConvertTo-Json -InputObject $InputObject -Depth 8 -Compress
-  $sb = New-Object System.Text.StringBuilder
-  foreach ($ch in $j.ToCharArray()) {
-    if ([int]$ch -gt 126) { [void]$sb.AppendFormat('\u{0:x4}', [int]$ch) } else { [void]$sb.Append($ch) }
-  }
-  $sb.ToString()
-}
-
-function Get-ManoResult {
-  param([string]$Action, [string]$Message, [hashtable]$Data)
-  $o = [ordered]@{ action = $Action; message = $Message }
-  if ($Data) { foreach ($kv in $Data.GetEnumerator()) { $o[$kv.Key] = $kv.Value } }   # GetEnumerator: a key named 'keys' must not hide .Keys
-  [pscustomobject]$o
-}
-
-function Format-ManoText {
-  param([object[]]$Results)
-  $objs = New-Object System.Collections.Generic.List[object]
-  foreach ($r in @($Results)) {
-    if ($null -eq $r) { continue }
-    if ($r -is [string]) { $r; continue }
-    if ($r.PSObject.Properties['message']) { "$($r.message)"; continue }
-    $objs.Add($r)
-  }
-  if ($objs.Count -eq 1) { ($objs[0] | Format-List | Out-String -Width 300).Trim() }
-  elseif ($objs.Count -gt 1) { ($objs | Format-Table -AutoSize | Out-String -Width 300).TrimEnd() }
-}
-
-# =====================================================================================================
-# 3. Estado y registros / state and logs
-# =====================================================================================================
-function Initialize-ManoPath {
-  param([string]$Root)
-  $script:Root = $Root
-  $script:ConfigFile = Join-Path $Root 'config.json'
-  $script:Cfg = Import-ManoConfig -Path $script:ConfigFile -MonitorOverride $env:MANOSEGURA_MONITOR -LanguageOverride $env:MANOSEGURA_LANG
-  $script:StateDir = Join-Path $Root 'state'
-  $script:LogsDir  = Join-Path $Root 'logs'
-  $script:ShotsDir = if ($script:Cfg.ShotsDir) { [Environment]::ExpandEnvironmentVariables($script:Cfg.ShotsDir) } else { Join-Path $Root 'shots' }
-  foreach ($d in $script:StateDir, $script:LogsDir, $script:ShotsDir) { if (-not (Test-Path -LiteralPath $d)) { [void](New-Item -ItemType Directory -Path $d -Force) } }
-  $script:DisabledFlag = Join-Path $script:StateDir 'disabled.flag'
-  $script:TrustFile    = Join-Path $script:StateDir 'trust.txt'
-  $script:TargetFile   = Join-Path $script:StateDir 'target.txt'
-  $script:RateFile     = Join-Path $script:StateDir 'rate.txt'
-  $script:ActivityFile = Join-Path $script:StateDir 'last-action.txt'
-  $script:AuditHead    = Join-Path $script:StateDir 'audit.head'
-  $script:LogFile      = Join-Path $script:LogsDir 'manosegura.log'
-  $script:AuditFile    = Join-Path $script:LogsDir 'audit.jsonl'
-}
-
-function Invoke-ManoLocked {
-  param([string]$Name, [scriptblock]$Script, [object[]]$ArgumentList = @())
-  $m = New-Object System.Threading.Mutex($false, $Name)
-  $got = $false
-  try {
-    try { $got = $m.WaitOne(5000) } catch [System.Threading.AbandonedMutexException] { $got = $true }
-    & $Script @ArgumentList
-  } finally { if ($got) { $m.ReleaseMutex() }; $m.Dispose() }
+    [int]$Code
+    ManoError([string]$message, [int]$code) : base($message) { $this.Code = $code }
 }
 
 function Write-ManoLog {
-  param([string]$Message)
-  try {
-    if ((Test-Path -LiteralPath $script:LogFile) -and (Get-Item -LiteralPath $script:LogFile).Length -gt 5MB) {
-      Move-Item -LiteralPath $script:LogFile -Destination "$($script:LogFile).1" -Force
+    param([string]$Message)
+    if (-not $script:LogFile) { return }
+    try {
+        $line = '{0:yyyy-MM-dd HH:mm:ss} [{1}] {2}' -f (Get-Date), $PID, $Message
+        Add-Content -LiteralPath $script:LogFile -Value $line -Encoding UTF8
+    } catch { }
+}
+
+function Get-ManoClipped {
+    param([string]$Text, [int]$Max = 200)
+    if ($null -eq $Text) { return '' }
+    if ($Text.Length -le $Max) { return $Text }
+    $Text.Substring(0, $Max) + '...'
+}
+
+function Throw-ManoError {
+    param([string]$Message, [int]$Code = 1)
+    throw [ManoError]::new($Message, $Code)
+}
+
+# =====================================================================================================
+# 2. Configuracion / configuration
+# =====================================================================================================
+function Get-ManoDefaultConfig {
+    [ordered]@{
+        TargetMonitor         = 'primary'
+        ConfirmMode           = 'ask'
+        ConfirmTimeoutSec     = 20
+        TrustMaxMinutes       = 120
+        ShotsDir              = ''
+        ShotFormat            = 'png'
+        ClickDelayMs          = 30
+        MaxBatchSteps         = 50
+        Overlay               = $true
+        BlockSensitiveWindows = $true
+        BlockedTitles         = @()
+        PanicHotkey           = 'Ctrl+Alt+P'
+        LogLines              = 500
     }
-    Add-Content -LiteralPath $script:LogFile -Encoding UTF8 -Value ("{0:yyyy-MM-dd HH:mm:ss} [{1}] {2}" -f (Get-Date), $PID, $Message)
-  } catch { Write-Verbose "log: $($_.Exception.Message)" }
 }
 
-function Get-ManoLastLine {
-  param([string]$Path)
-  if (-not (Test-Path -LiteralPath $Path)) { return $null }
-  $fs = [IO.File]::Open($Path, 'Open', 'Read', 'ReadWrite')
-  try {
-    $len = $fs.Length
-    if ($len -eq 0) { return $null }
-    $take = [int][math]::Min($len, 16384); [void]$fs.Seek(-$take, 'End')
-    $buf = New-Object byte[] $take; [void]$fs.Read($buf, 0, $take)
-  } finally { $fs.Dispose() }
-  $lines = @([Text.Encoding]::UTF8.GetString($buf) -split "`r?`n" | Where-Object { $_.Trim() })
-  if ($lines.Count) { $lines[-1] } else { $null }
-}
+function Import-ManoConfig {
+    param([string]$Path)
 
-function Write-ManoAudit {
-  param([string]$EventName, [string]$Detail)
-  try {
-    Invoke-ManoLocked 'Local\ManoSeguraAudit' -ArgumentList @($EventName, $Detail) -Script {
-      param($ev, $dt)
-      $prev = $script:GenesisHash; $seq = 1
-      $last = Get-ManoLastLine $script:AuditFile
-      if ($last) { $lo = $last | ConvertFrom-Json; $prev = "$($lo.hash)"; $seq = [long]$lo.seq + 1 }
-      $now = (Get-Date).ToString('yyyy-MM-dd HH:mm:ss.fff zzz', [Globalization.CultureInfo]::InvariantCulture)
-      $rec = Get-ManoAuditRecord -Seq $seq -Prev $prev -EventName $ev -Detail $dt -Time $now -ProcessId $PID
-      $line = ConvertTo-Json -InputObject $rec -Compress
-      $enc = New-Object System.Text.UTF8Encoding($false)
-      [IO.File]::AppendAllText($script:AuditFile, $line + "`n", $enc)
-      [IO.File]::WriteAllText($script:AuditHead, "$($rec.seq) $($rec.hash)", $enc)
+    $cfg = Get-ManoDefaultConfig
+    $warnings = New-Object System.Collections.Generic.List[string]
+
+    if ($Path -and (Test-Path -LiteralPath $Path)) {
+        try {
+            $raw = Get-Content -LiteralPath $Path -Raw -Encoding UTF8
+            $json = $raw | ConvertFrom-Json
+        } catch {
+            $warnings.Add("config.json no valido, uso los valores por defecto: $($_.Exception.Message)")
+            $json = $null
+        }
+        if ($null -ne $json) {
+            foreach ($key in @('TargetMonitor', 'ConfirmMode', 'ConfirmTimeoutSec', 'TrustMaxMinutes', 'ShotsDir', 'ShotFormat', 'ClickDelayMs', 'MaxBatchSteps', 'Overlay', 'BlockSensitiveWindows', 'BlockedTitles', 'PanicHotkey', 'LogLines')) {
+                if ($null -ne $json.PSObject.Properties[$key]) {
+                    if ($key -eq 'BlockedTitles') { $cfg[$key] = @($json.$key) }
+                    else { $cfg[$key] = $json.$key }
+                }
+            }
+        }
     }
-  } catch { Write-ManoLog "AUDITORIA FALLO: $($_.Exception.Message)" }
+
+    $cfg.ConfirmMode = ([string]$cfg.ConfirmMode).Trim().ToLowerInvariant()
+    if ($cfg.ConfirmMode -notin @('ask', 'auto')) {
+        $warnings.Add("ConfirmMode '$($cfg.ConfirmMode)' no valido (ask/auto); uso 'ask'.")
+        $cfg.ConfirmMode = 'ask'
+    }
+    foreach ($item in @(
+            @{ Key = 'ConfirmTimeoutSec'; Min = 5; Max = 300 },
+            @{ Key = 'TrustMaxMinutes'; Min = 1; Max = 1440 },
+            @{ Key = 'ClickDelayMs'; Min = 0; Max = 1000 },
+            @{ Key = 'MaxBatchSteps'; Min = 1; Max = 200 },
+            @{ Key = 'LogLines'; Min = 50; Max = 5000 }
+        )) {
+        $n = 0
+        $parsed = [int]::TryParse([string]$cfg[$item.Key], [ref]$n)
+        if (-not $parsed) {
+            $warnings.Add("$($item.Key) no es un numero; uso el valor por defecto.")
+            $cfg[$item.Key] = (Get-ManoDefaultConfig)[$item.Key]
+        } elseif ($n -lt $item.Min -or $n -gt $item.Max) {
+            $clamped = if ($n -lt $item.Min) { $item.Min } else { $item.Max }
+            $warnings.Add("$($item.Key)=$n fuera de rango ($($item.Min)-$($item.Max)); uso $clamped.")
+            $cfg[$item.Key] = $clamped
+        } else {
+            $cfg[$item.Key] = $n
+        }
+    }
+    $cfg.ShotFormat = ([string]$cfg.ShotFormat).Trim().ToLowerInvariant()
+    if ($cfg.ShotFormat -notin @('png', 'jpg', 'jpeg')) {
+        $warnings.Add("ShotFormat '$($cfg.ShotFormat)' no valido (png/jpg); uso 'png'.")
+        $cfg.ShotFormat = 'png'
+    }
+    if ($cfg.ShotFormat -eq 'jpeg') { $cfg.ShotFormat = 'jpg' }
+    foreach ($b in @('Overlay', 'BlockSensitiveWindows')) {
+        $v = $cfg[$b]
+        if ($v -is [string]) { $cfg[$b] = ($v -match '^(?i)(true|1|si|yes)$') }
+        else { $cfg[$b] = [bool]$v }
+    }
+    if ($cfg.BlockedTitles -is [string]) { $cfg.BlockedTitles = @([string]$cfg.BlockedTitles) }
+    $cfg.BlockedTitles = @(@($cfg.BlockedTitles) | Where-Object { $_ -and "$_".Trim() } | ForEach-Object { [string]$_ })
+
+    $hotkeyOk = $true
+    try { Convert-ManoHotkey ([string]$cfg.PanicHotkey) | Out-Null } catch { $hotkeyOk = $false }
+    if (-not $hotkeyOk) {
+        $warnings.Add("PanicHotkey '$($cfg.PanicHotkey)' no se entiende; uso Ctrl+Alt+P.")
+        $cfg.PanicHotkey = 'Ctrl+Alt+P'
+    }
+    $target = ([string]$cfg.TargetMonitor).Trim()
+    if (-not $target) { $cfg.TargetMonitor = 'primary' } else { $cfg.TargetMonitor = $target }
+
+    [pscustomobject]@{ Config = $cfg; Warnings = @($warnings) }
 }
 
-function Write-ManoEvent {
-  param([string]$EventName, [string]$Detail)
-  Write-ManoLog "$($EventName): $Detail"
-  Write-ManoAudit $EventName $Detail
+function Save-ManoConfig {
+    param([System.Collections.IDictionary]$Config)
+    $json = [ordered]@{}
+    foreach ($key in (Get-ManoDefaultConfig).Keys) { $json[$key] = $Config[$key] }
+    ($json | ConvertTo-Json -Depth 5) | Set-Content -LiteralPath $script:ConfigFile -Encoding UTF8
+    Write-ManoLog 'config.json guardado'
 }
 
-function Test-ManoTrust {
-  if (-not (Test-Path -LiteralPath $script:TrustFile)) { return $false }
-  $txt = ''
-  try { $txt = Get-Content -LiteralPath $script:TrustFile -Raw } catch { return $false }
-  Test-ManoTrustValue $txt (Get-Date) ([int]$script:Cfg.TrustMaxMinutes)
+function Set-ManoConfigValue {
+    param([string]$Key, [string]$Value)
+    $defaults = Get-ManoDefaultConfig
+    if (-not $defaults.Contains($Key)) { Throw-ManoError "Ajuste desconocido: $Key. Ajustes: $((($defaults.Keys) -join ', '))" 1 }
+    $new = [ordered]@{}
+    foreach ($k in $defaults.Keys) { $new[$k] = $script:Cfg[$k] }
+    if ($Key -eq 'BlockedTitles') {
+        $new[$Key] = @($Value -split ',' | ForEach-Object { $_.Trim() } | Where-Object { $_ })
+    } elseif ($Key -in @('Overlay', 'BlockSensitiveWindows')) {
+        $new[$Key] = ($Value -match '^(?i)(true|1|si|yes|on)$')
+    } else {
+        $new[$Key] = $Value
+    }
+    Save-ManoConfig $new
+    $loaded = Import-ManoConfig -Path $script:ConfigFile
+    $script:Cfg = $loaded.Config
+    Write-ManoLog "config: $Key=$Value"
+    "OK $Key = $($script:Cfg[$Key])"
 }
 
-function Revoke-ManoTrust {
-  param([string]$Reason)
-  if (Test-Path -LiteralPath $script:TrustFile) {
+# =====================================================================================================
+# 3. Entorno y estado / environment and state
+# =====================================================================================================
+function Initialize-ManoEnvironment {
+    param([string]$RootPath)
+
+    $script:Root = $RootPath
+    $script:ConfigFile = Join-Path $script:Root 'config.json'
+    $script:StateDir = Join-Path $script:Root 'state'
+    $script:LogsDir = Join-Path $script:Root 'logs'
+    $loaded = Import-ManoConfig -Path $script:ConfigFile
+    $script:Cfg = $loaded.Config
+    $script:Warnings = New-Object System.Collections.Generic.List[string]
+    foreach ($w in $loaded.Warnings) { $script:Warnings.Add($w) }
+
+    $shots = if ($script:Cfg.ShotsDir) { [Environment]::ExpandEnvironmentVariables([string]$script:Cfg.ShotsDir) } else { Join-Path $script:Root 'shots' }
+    $script:ShotsDir = $shots
+    foreach ($dir in @($script:StateDir, $script:LogsDir, $script:ShotsDir)) {
+        if (-not (Test-Path -LiteralPath $dir)) { [void](New-Item -ItemType Directory -Path $dir -Force) }
+    }
+    $script:DisabledFlag = Join-Path $script:StateDir 'disabled.flag'
+    $script:TrustFile = Join-Path $script:StateDir 'trust.txt'
+    $script:TargetFile = Join-Path $script:StateDir 'target.txt'
+    $script:LogFile = Join-Path $script:LogsDir 'manosegura.log'
+}
+
+function Test-ManoDisabled { Test-Path -LiteralPath $script:DisabledFlag }
+
+function Set-ManoDisabled {
+    param([bool]$Disabled)
+    if ($Disabled) {
+        Set-Content -LiteralPath $script:DisabledFlag -Value (Get-Date).ToString('o')
+        Write-ManoLog 'DESACTIVADA'
+    } else {
+        Remove-Item -LiteralPath $script:DisabledFlag -Force -ErrorAction SilentlyContinue
+        Write-ManoLog 'ACTIVADA'
+    }
+}
+
+function Get-ManoTrustExpiry {
+    param([string]$Text)
+    $t = [datetime]::MinValue
+    if (-not [datetime]::TryParse("$Text".Trim(), [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::RoundtripKind, [ref]$t)) { return $null }
+    $t.ToLocalTime()
+}
+
+function Test-ManoTrustValue {
+    param([string]$Text, [datetime]$Now, [int]$MaxMinutes)
+    $t = Get-ManoTrustExpiry $Text
+    if ($null -eq $t) { return $false }
+    ($t -gt $Now) -and ($t -le $Now.AddMinutes($MaxMinutes + 1))
+}
+
+function Test-ManoTrustActive {
+    if (-not (Test-Path -LiteralPath $script:TrustFile)) { return $false }
+    try {
+        Test-ManoTrustValue (Get-Content -LiteralPath $script:TrustFile -Raw) (Get-Date) ([int]$script:Cfg.TrustMaxMinutes)
+    } catch {
+        return $false
+    }
+}
+
+function Set-ManoTrustMinutes {
+    param([int]$Minutes)
+    $max = [int]$script:Cfg.TrustMaxMinutes
+    if ($Minutes -lt 1) { $Minutes = 1 }
+    if ($Minutes -gt $max) { $Minutes = $max }
+    (Get-Date).AddMinutes($Minutes).ToString('o') | Set-Content -LiteralPath $script:TrustFile
+    Write-ManoLog "modo confianza $Minutes min"
+    $Minutes
+}
+
+function Clear-ManoTrust {
     Remove-Item -LiteralPath $script:TrustFile -Force -ErrorAction SilentlyContinue
-    Write-ManoEvent 'CONFIANZA_RETIRADA' $Reason
-  }
+    Write-ManoLog 'modo confianza desactivado'
 }
 
-function Register-ManoRate {
-  param([int]$Count = 1)
-  if ($script:DryRun -or $Count -le 0) { return }
-  $max = [int]$script:Cfg.MaxActionsPerMinute
-  $res = Invoke-ManoLocked $script:MutexState -ArgumentList @($Count, $max) -Script {
-    param($n, $limit)
-    $hist = @()
-    if (Test-Path -LiteralPath $script:RateFile) {
-      $hist = @(Get-Content -LiteralPath $script:RateFile | ForEach-Object { $tk = 0L; if ([long]::TryParse("$_", [ref]$tk)) { [datetime]::new($tk, [DateTimeKind]::Utc) } })
-    }
-    $now = [datetime]::UtcNow
-    $r = Test-ManoRateLimit -History $hist -Now $now -Max $limit -Count $n
-    $keep = @($r.Recent)
-    if ($r.Allowed) { $keep += @(1..$n | ForEach-Object { $now }) }
-    Set-Content -LiteralPath $script:RateFile -Value @($keep | ForEach-Object { $_.Ticks }) -Encoding ASCII
-    $r
-  }
-  if ($res.NeverFits) { throw (Get-ManoError 'E_RATE_BATCH' @($Count, $max)) }
-  if (-not $res.Allowed) { throw (Get-ManoError 'E_RATE_LIMIT' @($max, $res.RetryAfterSec)) }
-}
-
-function Assert-ManoEnabled {
-  if (Test-Path -LiteralPath $script:DisabledFlag) { throw (Get-ManoError 'E_DISABLED') }
-}
-
-function Write-ManoActivity {
-  try { Set-Content -LiteralPath $script:ActivityFile -Value (Get-Date).ToString('o') -Encoding ASCII } catch { Write-Verbose 'activity' }
-}
-
-# =====================================================================================================
-# 4. Windows: nativo, ventanas, dialogos / native, windows, dialogs (Windows only)
-# =====================================================================================================
-function Test-ManoWindowsHost { ($env:OS -eq 'Windows_NT') -or ([Environment]::OSVersion.Platform -eq [PlatformID]::Win32NT) }
-
-$script:NativeCode = @'
-[DllImport("user32.dll")] public static extern bool SetProcessDPIAware();
-[DllImport("user32.dll")] public static extern bool SetProcessDpiAwarenessContext(IntPtr v);
-[DllImport("user32.dll")] public static extern IntPtr SetThreadDpiAwarenessContext(IntPtr v);
-[DllImport("shcore.dll")] public static extern int SetProcessDpiAwareness(int v);
-[DllImport("shcore.dll")] public static extern int GetDpiForMonitor(IntPtr m, int t, out uint x, out uint y);
-[StructLayout(LayoutKind.Sequential)] public struct POINT { public int X, Y; }
-[DllImport("user32.dll")] public static extern IntPtr MonitorFromPoint(POINT p, uint f);
-public delegate bool EnumProc(IntPtr h, IntPtr p);
-[DllImport("user32.dll")] public static extern bool EnumWindows(EnumProc cb, IntPtr p);
-[DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr h);
-[DllImport("user32.dll")] public static extern bool IsWindow(IntPtr h);
-[DllImport("user32.dll")] public static extern bool IsIconic(IntPtr h);
-[DllImport("user32.dll", CharSet=CharSet.Unicode)] public static extern int GetWindowText(IntPtr h, StringBuilder s, int n);
-[DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr h, out uint pid);
-[DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr h, IntPtr pid);
-[DllImport("kernel32.dll")] public static extern uint GetCurrentThreadId();
-[DllImport("user32.dll")] public static extern bool AttachThreadInput(uint a, uint b, bool f);
-[StructLayout(LayoutKind.Sequential)] public struct RECT { public int L, T, R, B; }
-[DllImport("user32.dll")] public static extern bool GetWindowRect(IntPtr h, out RECT r);
-[DllImport("dwmapi.dll")] public static extern int DwmGetWindowAttribute(IntPtr h, int a, out RECT r, int s);
-[DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr h);
-[DllImport("user32.dll")] public static extern bool BringWindowToTop(IntPtr h);
-[DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
-[DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr h, int c);
-[DllImport("user32.dll")] public static extern bool SetWindowPos(IntPtr h, IntPtr after, int x, int y, int cx, int cy, uint f);
-[DllImport("user32.dll")] public static extern int GetWindowLong(IntPtr h, int i);
-[DllImport("user32.dll")] public static extern int SetWindowLong(IntPtr h, int i, int v);
-[DllImport("user32.dll")] public static extern bool SetCursorPos(int x, int y);
-[DllImport("user32.dll")] public static extern void mouse_event(uint f, int x, int y, int d, IntPtr e);
-[DllImport("user32.dll")] public static extern void keybd_event(byte k, byte s, uint f, IntPtr e);
-[DllImport("user32.dll")] public static extern bool RegisterHotKey(IntPtr h, int id, uint mod, uint vk);
-[DllImport("user32.dll")] public static extern bool UnregisterHotKey(IntPtr h, int id);
-[DllImport("user32.dll", CharSet=CharSet.Unicode)] public static extern bool EnumDisplayDevices(string dev, uint i, ref DISPLAY_DEVICE d, uint f);
-[StructLayout(LayoutKind.Sequential, CharSet=CharSet.Unicode)] public struct DISPLAY_DEVICE { public int cb; [MarshalAs(UnmanagedType.ByValTStr, SizeConst=32)] public string DeviceName; [MarshalAs(UnmanagedType.ByValTStr, SizeConst=128)] public string DeviceString; public int StateFlags; [MarshalAs(UnmanagedType.ByValTStr, SizeConst=128)] public string DeviceID; [MarshalAs(UnmanagedType.ByValTStr, SizeConst=128)] public string DeviceKey; }
-'@
-
-function Initialize-ManoNative {
-  Add-Type -AssemblyName System.Windows.Forms, System.Drawing, UIAutomationClient, UIAutomationTypes
-  if (-not ('ManoSegura.Native' -as [type])) {
-    Add-Type -Namespace ManoSegura -Name Native -UsingNamespace System.Text -MemberDefinition $script:NativeCode
-  }
-  Initialize-ManoDpi
-}
-
-# Per-monitor DPI awareness so window rects, cursor and screen bounds all use the same physical pixels,
-# also on mixed-DPI setups and monitors at negative coordinates (e.g. X = -1920).
-function Initialize-ManoDpi {
-  $ok = $false
-  try { $ok = [ManoSegura.Native]::SetProcessDpiAwarenessContext([IntPtr](-4)) } catch { $ok = $false }   # PER_MONITOR_AWARE_V2 (Win10 1703+)
-  if (-not $ok) { try { $ok = ([ManoSegura.Native]::SetProcessDpiAwareness(2) -eq 0) } catch { $ok = $false } }   # Win8.1+
-  if (-not $ok) { try { [void][ManoSegura.Native]::SetProcessDPIAware() } catch { Write-Verbose 'dpi' } }
-  try { [void][ManoSegura.Native]::SetThreadDpiAwarenessContext([IntPtr](-4)) } catch { Write-Verbose 'thread dpi' }
-}
-
-function Get-ManoDpiScale {
-  param($Monitor)
-  try {
-    $pt = New-Object ManoSegura.Native+POINT
-    $pt.X = [int]($Monitor.Bounds.X + $Monitor.Bounds.Width / 2); $pt.Y = [int]($Monitor.Bounds.Y + $Monitor.Bounds.Height / 2)
-    $hm = [ManoSegura.Native]::MonitorFromPoint($pt, 2)
-    $dx = [uint32]0; $dy = [uint32]0
-    if ([ManoSegura.Native]::GetDpiForMonitor($hm, 0, [ref]$dx, [ref]$dy) -eq 0 -and $dx -gt 0) { return [math]::Max(1.0, $dx / 96.0) }
-  } catch { Write-Verbose 'dpi scale' }
-  1.0
-}
-
-$script:MonCache = $null
-function Get-ManoMonitor {
-  if ($script:MonCache) { return $script:MonCache }
-  $script:MonCache = @(foreach ($s in [System.Windows.Forms.Screen]::AllScreens) {
-      $dd = New-Object ManoSegura.Native+DISPLAY_DEVICE; $dd.cb = [Runtime.InteropServices.Marshal]::SizeOf($dd)
-      $ids = @(); $i = 0
-      while ([ManoSegura.Native]::EnumDisplayDevices($s.DeviceName, $i, [ref]$dd, 0)) { $ids += "$($dd.DeviceID) $($dd.DeviceString)"; $i++ }
-      [pscustomobject]@{ DeviceName = $s.DeviceName; Bounds = $s.Bounds; WorkingArea = $s.WorkingArea; Primary = $s.Primary; MonitorId = ($ids -join ' ; ') }
-    })
-  $script:MonCache
-}
-
-function Find-ManoMonitor {
-  param([string]$Spec)
-  $m = Select-ManoMonitor (Get-ManoMonitor) $Spec
-  if (-not $m) { throw (Get-ManoError 'E_MONITOR_NOT_FOUND' @($Spec)) }
-  $m
-}
-function Get-ManoTargetMonitor { Find-ManoMonitor "$($script:Cfg.TargetMonitor)" }
-
-function Get-ManoRect {
-  param([IntPtr]$Handle)
-  $r = New-Object ManoSegura.Native+RECT
-  if ([ManoSegura.Native]::DwmGetWindowAttribute($Handle, 9, [ref]$r, 16) -ne 0) { [void][ManoSegura.Native]::GetWindowRect($Handle, [ref]$r) }
-  [System.Drawing.Rectangle]::FromLTRB($r.L, $r.T, $r.R, $r.B)
-}
-function Get-ManoTitle {
-  param([IntPtr]$Handle)
-  $sb = New-Object Text.StringBuilder 512; [void][ManoSegura.Native]::GetWindowText($Handle, $sb, 512); $sb.ToString()
-}
-function Get-ManoWindowProcess {
-  param([IntPtr]$Handle)
-  $p = [uint32]0; [void][ManoSegura.Native]::GetWindowThreadProcessId($Handle, [ref]$p)
-  try { (Get-Process -Id ([int]$p) -ErrorAction Stop).ProcessName } catch { '' }
-}
-
-function Get-ManoWindow {
-  param([switch]$AllMonitors)
-  $list = New-Object Collections.ArrayList
-  $cb = [ManoSegura.Native+EnumProc] { param($hw, $lp) if ([ManoSegura.Native]::IsWindowVisible($hw)) { [void]$list.Add($hw) }; $null -ne $lp }
-  [void][ManoSegura.Native]::EnumWindows($cb, [IntPtr]::Zero)
-  $mon = $null; if (-not $AllMonitors) { $mon = Get-ManoTargetMonitor }
-  $procs = @{}; Get-Process | ForEach-Object { $procs[[uint32]$_.Id] = $_.ProcessName }
-  $extra = @($script:Cfg.ExtraBlockedTitles)
-  foreach ($hw in $list) {
-    $t = Get-ManoTitle $hw
-    if (-not $t) { continue }
-    $p = [uint32]0; [void][ManoSegura.Native]::GetWindowThreadProcessId($hw, [ref]$p); $r = Get-ManoRect $hw
-    $pn = $procs[$p]
-    [pscustomobject]@{
-      Hwnd = [int64]$hw; Proceso = $pn; Titulo = $t; Rect = (Format-ManoRect $r)
-      EnMonitor = $(if ($mon) { Test-ManoRectInside $r $mon.Bounds } else { $null })
-      Bloqueada = (Test-ManoBlockedTitle $t $extra); Navegador = (Test-ManoBrowser $pn $script:Cfg.ExtraBrowsers)
-    }
-  }
-}
-
-# Snapshot of visible browser windows (any browser, any monitor): used to detect windows that appear by surprise.
-function Get-ManoBrowserWindowSet {
-  if ($script:DryRun) { return @() }
-  @(Get-ManoWindow -AllMonitors | Where-Object { $_.Navegador } | ForEach-Object { $_.Hwnd })
+function Set-ManoTarget {
+    param([IntPtr]$Hwnd)
+    "$([int64]$Hwnd)" | Set-Content -LiteralPath $script:TargetFile
 }
 
 function Get-ManoTarget {
-  if (-not (Test-Path -LiteralPath $script:TargetFile)) { throw (Get-ManoError 'E_NO_TARGET') }
-  $v = 0L
-  if (-not [long]::TryParse((Get-Content -LiteralPath $script:TargetFile -Raw).Trim(), [ref]$v)) { throw (Get-ManoError 'E_NO_TARGET') }
-  $h = [IntPtr]$v
-  if (-not [ManoSegura.Native]::IsWindow($h)) { throw (Get-ManoError 'E_TARGET_GONE') }
-  $h
-}
-function Assert-ManoAllowed {
-  param([IntPtr]$Handle)
-  $t = Get-ManoTitle $Handle
-  if (Test-ManoBlockedTitle $t @($script:Cfg.ExtraBlockedTitles)) { throw (Get-ManoError 'E_BLOCKED_WINDOW' @($t)) }
-  $t
-}
-function Assert-ManoOnMonitor {
-  param([IntPtr]$Handle)
-  $r = Get-ManoRect $Handle; $m = Get-ManoTargetMonitor
-  if (-not (Test-ManoRectInside $r $m.Bounds)) { throw (Get-ManoError 'E_OFF_MONITOR' @((Format-ManoRect $r), $m.DeviceName, (Format-ManoRect $m.Bounds))) }
-  $r
-}
-
-# The panic guard runs in its own VISIBLE process (minimized console + tray icon + banner); no hidden windows, no Bypass.
-function Assert-ManoGuard {
-  if ($script:DryRun) { return }
-  $m = $null
-  if ([Threading.Mutex]::TryOpenExisting($script:MutexPanic, [ref]$m)) { $m.Dispose(); return }
-  $exe = (Get-Process -Id $PID).Path
-  Start-Process -FilePath $exe -WindowStyle Minimized -ArgumentList @('-NoProfile', '-STA', '-File', "`"$script:Self`"", '_guard') | Out-Null
-  for ($i = 0; $i -lt 80; $i++) {
-    Start-Sleep -Milliseconds 100
-    if ([Threading.Mutex]::TryOpenExisting($script:MutexPanic, [ref]$m)) { $m.Dispose(); return }
-  }
-  throw (Get-ManoError 'E_GUARD')
-}
-
-function Get-ManoFont {
-  param([double]$Px, [switch]$Bold)
-  $style = if ($Bold) { [Drawing.FontStyle]::Bold } else { [Drawing.FontStyle]::Regular }
-  New-Object Drawing.Font('Segoe UI', [float]$Px, $style, [Drawing.GraphicsUnit]::Pixel)
-}
-
-function New-ManoDialogControl {
-  [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSUseShouldProcessForStateChangingFunctions', '', Justification = 'Creates an in-memory control only.')]
-  param([string]$Type, [double]$Scale, [int]$X, [int]$Y, [int]$Width, [int]$Height, [double]$FontPx = 13, [switch]$Bold)
-  $c = New-Object "Windows.Forms.$Type"
-  $c.Location = New-Object Drawing.Point([int]($X * $Scale), [int]($Y * $Scale))
-  $c.Size = New-Object Drawing.Size([int]($Width * $Scale), [int]($Height * $Scale))
-  $c.Font = Get-ManoFont ($FontPx * $Scale) -Bold:$Bold
-  $c
-}
-
-# ---------- confirmation dialog (on the target monitor, scaled to its DPI) ----------
-function Request-ManoPermission {
-  param([string]$Description, [switch]$NoTrust, [switch]$IgnoreDisabled, [switch]$Warning)
-  $flat = $Description -replace "`r?`n", ' | '
-  if ($script:DryRun) { $script:Notes.Add("[dry-run] pediria permiso / would ask: $flat"); return $true }
-  if (-not $NoTrust -and (Test-ManoTrust)) { Write-ManoEvent 'AUTO_CONFIANZA' $flat; return $true }
-  $a = Get-ManoTargetMonitor; $s = Get-ManoDpiScale $a; $timeout = [int]$script:Cfg.ConfirmTimeoutSec
-  $f = New-Object Windows.Forms.Form
-  $f.Text = 'ManoSegura - confirmar / confirm'; $f.TopMost = $true; $f.FormBorderStyle = 'FixedDialog'; $f.ControlBox = $false; $f.ShowInTaskbar = $true
-  $f.StartPosition = 'Manual'; $f.AutoScaleMode = 'None'
-  $f.ClientSize = New-Object Drawing.Size([int](580 * $s), [int](330 * $s))
-  $f.BackColor = [Drawing.Color]::FromArgb(24, 28, 32); $f.ForeColor = [Drawing.Color]::White
-  $f.Location = New-Object Drawing.Point([int]($a.WorkingArea.Right - $f.Width - 20 * $s), [int]($a.WorkingArea.Top + 40 * $s))
-  $hdr = New-ManoDialogControl 'Label' $s 15 10 550 26 17 -Bold
-  $hdr.Text = if ($Warning) { 'ATENCION / WARNING - el asistente quiere / the assistant wants to:' } else { 'El asistente quiere / The assistant wants to:' }
-  $hdr.ForeColor = if ($Warning) { [Drawing.Color]::FromArgb(255, 170, 60) } else { [Drawing.Color]::FromArgb(61, 220, 151) }
-  $lbl = New-ManoDialogControl 'TextBox' $s 15 42 550 150 14
-  $lbl.Multiline = $true; $lbl.ReadOnly = $true; $lbl.ScrollBars = 'Vertical'; $lbl.BorderStyle = 'None'
-  $lbl.BackColor = $f.BackColor; $lbl.ForeColor = [Drawing.Color]::White
-  $lbl.Text = "$Description`r`n`r`n(Ctrl+Alt+P = PANICO / PANIC)"
-  $chk = New-ManoDialogControl 'CheckBox' $s 15 202 300 26; $chk.Text = 'Modo confianza / trust mode (min):'
-  $num = New-ManoDialogControl 'NumericUpDown' $s 320 202 70 26
-  $num.Minimum = 1; $num.Maximum = [int]$script:Cfg.TrustMaxMinutes; $num.Value = [math]::Min(10, [int]$script:Cfg.TrustMaxMinutes)
-  if ($NoTrust) { $chk.Enabled = $false; $num.Enabled = $false }
-  $cnt = New-ManoDialogControl 'Label' $s 15 245 290 26
-  $ok = New-ManoDialogControl 'Button' $s 310 280 125 36; $ok.Text = 'Permitir / Allow'
-  $ok.BackColor = [Drawing.Color]::FromArgb(61, 220, 151); $ok.ForeColor = [Drawing.Color]::Black
-  $no = New-ManoDialogControl 'Button' $s 443 280 125 36; $no.Text = 'Cancelar / Cancel'
-  $no.ForeColor = [Drawing.Color]::Black; $no.BackColor = [Drawing.Color]::LightGray
-  $script:DlgResult = $false; $script:DlgLeft = $timeout
-  $ok.Add_Click({ $script:DlgResult = $true; $f.Close() }); $no.Add_Click({ $f.Close() })
-  $tm = New-Object Windows.Forms.Timer; $tm.Interval = 1000
-  $tm.Add_Tick({
-      $script:DlgLeft--; $cnt.Text = "Se cancela sola en $($script:DlgLeft) s / auto-cancel"
-      if ($script:DlgLeft -le 0 -or (-not $IgnoreDisabled -and (Test-Path -LiteralPath $script:DisabledFlag))) { $f.Close() } })
-  $f.Controls.AddRange(@($hdr, $lbl, $chk, $num, $cnt, $ok, $no)); $f.CancelButton = $no
-  $cnt.Text = "Se cancela sola en $timeout s / auto-cancel"; $f.Add_Shown({ $f.Activate(); [void]$no.Focus() }); $tm.Start()
-  [void]$f.ShowDialog(); $tm.Stop(); $f.Dispose()
-  if (-not $IgnoreDisabled -and (Test-Path -LiteralPath $script:DisabledFlag)) { $script:DlgResult = $false }
-  if ($script:DlgResult -and $chk.Checked) {
-    (Get-Date).AddMinutes([int]$num.Value).ToString('o') | Set-Content -LiteralPath $script:TrustFile -Encoding ASCII
-    Write-ManoEvent 'CONFIANZA_CONCEDIDA' "$($num.Value) min"
-  }
-  Write-ManoEvent $(if ($script:DlgResult) { 'PERMITIDO' } else { 'CANCELADO' }) $flat
-  $script:DlgResult
-}
-
-# ---------- focus (only when needed) ----------
-function Invoke-ManoFocus {
-  param([IntPtr]$Handle)
-  if ([ManoSegura.Native]::GetForegroundWindow() -eq $Handle) { return $true }
-  if ($script:DryRun) { return $true }
-  if ([ManoSegura.Native]::IsIconic($Handle)) { [void][ManoSegura.Native]::ShowWindow($Handle, 9) }
-  $fg = [ManoSegura.Native]::GetForegroundWindow(); $me = [ManoSegura.Native]::GetCurrentThreadId()
-  $t1 = [ManoSegura.Native]::GetWindowThreadProcessId($fg, [IntPtr]::Zero); $t2 = [ManoSegura.Native]::GetWindowThreadProcessId($Handle, [IntPtr]::Zero)
-  [void][ManoSegura.Native]::AttachThreadInput($me, $t1, $true); [void][ManoSegura.Native]::AttachThreadInput($me, $t2, $true)
-  try {
-    [ManoSegura.Native]::keybd_event(0x12, 0, 0, [IntPtr]::Zero); [ManoSegura.Native]::keybd_event(0x12, 0, 2, [IntPtr]::Zero)   # ALT tap unlocks SetForegroundWindow
-    [void][ManoSegura.Native]::BringWindowToTop($Handle); [void][ManoSegura.Native]::SetForegroundWindow($Handle)
-  } finally { [void][ManoSegura.Native]::AttachThreadInput($me, $t1, $false); [void][ManoSegura.Native]::AttachThreadInput($me, $t2, $false) }
-  for ($i = 0; $i -lt 15; $i++) { if ([ManoSegura.Native]::GetForegroundWindow() -eq $Handle) { return $true }; Start-Sleep -Milliseconds 20 }
-  $false
-}
-
-function Assert-ManoForeground {
-  param([IntPtr]$Handle)
-  if ($script:DryRun) { return }
-  Assert-ManoEnabled
-  if ([ManoSegura.Native]::GetForegroundWindow() -ne $Handle) { throw (Get-ManoError 'E_FOCUS_LOST') }
-}
-
-# Checks the focused UI element: never a password field; in browsers never the address bar (only "navigate" uses it).
-function Assert-ManoSafeField {
-  param($Prep, [switch]$KeyOnly, [string]$Combo)
-  if ($script:DryRun) { return }
-  try { $fe = [Windows.Automation.AutomationElement]::FocusedElement } catch { $fe = $null }
-  if (-not $fe) {
-    if ($KeyOnly -and -not $Prep.IsBrowser) { return }
-    throw (Get-ManoError 'E_FIELD_UNKNOWN')
-  }
-  $cur = $fe.Current
-  $pasteKey = $Combo -in @('ctrl+v', 'shift+insert')
-  if ($cur.IsPassword -and (-not $KeyOnly -or $pasteKey)) { throw (Get-ManoError 'E_PASSWORD_FIELD') }
-  if ($Prep.IsBrowser -and (Test-ManoAddressBarElement $cur.Name $cur.AutomationId $cur.ClassName)) { throw (Get-ManoError 'E_ADDRESS_BAR') }
-}
-
-# Validates target, rate limit, asks permission (unless the batch was already approved), focuses.
-function Invoke-ManoPrepare {
-  param([string]$Description, [switch]$NoTrust, [switch]$Warning)
-  Assert-ManoEnabled; Assert-ManoGuard
-  $h = Get-ManoTarget; $t = Assert-ManoAllowed $h; [void](Assert-ManoOnMonitor $h)
-  $proc = Get-ManoWindowProcess $h; $isB = Test-ManoBrowser $proc $script:Cfg.ExtraBrowsers
-  if (-not $script:BatchApproved) {
-    Register-ManoRate 1
-    $kind = if ($isB) { 'navegador / browser' } else { 'app' }
-    if (-not (Request-ManoPermission "$Description`r`nVentana / window: $t`r`nProceso / process: $proc ($kind)" -NoTrust:$NoTrust -Warning:$Warning)) { throw (Get-ManoError 'E_CANCELLED' @($Description)) }
-  }
-  Assert-ManoEnabled
-  $before = Get-ManoBrowserWindowSet
-  if (-not (Invoke-ManoFocus $h)) { throw (Get-ManoError 'E_FOCUS_FAILED') }
-  [void](Assert-ManoAllowed $h)   # the title may have changed (e.g. navigated to a login page)
-  Write-ManoActivity
-  @{ H = $h; R = (Get-ManoRect $h); T = $t; Proc = $proc; IsBrowser = $isB; Before = $before }
-}
-
-# After an action: the window must still be allowed, and no surprise browser windows may have appeared.
-function Assert-ManoAfterAction {
-  param($Prep, [int]$DelayMs = 250)
-  if ($script:DryRun) { return }
-  Start-Sleep -Milliseconds $DelayMs
-  if ([ManoSegura.Native]::IsWindow($Prep.H)) {
-    $t = Get-ManoTitle $Prep.H
-    if (Test-ManoBlockedTitle $t @($script:Cfg.ExtraBlockedTitles)) {
-      Revoke-ManoTrust 'pagina prohibida tras la accion'
-      Write-ManoEvent 'BLOQUEO_TRAS_ACCION' $t
-      throw (Get-ManoError 'E_NOW_BLOCKED' @($t))
-    }
-  }
-  if (-not $script:Cfg.AllowNewTabs) {
-    $known = @($Prep.Before)
-    $new = @(Get-ManoWindow -AllMonitors | Where-Object { $_.Navegador -and $known -notcontains $_.Hwnd })
-    if ($new.Count) {
-      $desc = ($new | ForEach-Object { "$($_.Proceso) '$($_.Titulo)' (hwnd $($_.Hwnd))" }) -join '; '
-      Revoke-ManoTrust 'ventana de navegador nueva'
-      Write-ManoEvent 'VENTANA_NUEVA' $desc
-      throw (Get-ManoError 'E_NEW_WINDOW' @($desc))
-    }
-  }
-}
-
-# ---------- screenshots ----------
-function Save-ManoBitmap {
-  param($Bitmap, [string]$Path)
-  if (-not $Path) { $Path = Join-Path $script:ShotsDir ("shot_{0:yyyyMMdd_HHmmss_fff}.png" -f (Get-Date)) }
-  $Bitmap.Save($Path, [Drawing.Imaging.ImageFormat]::Png); $Bitmap.Dispose()
-  Copy-Item -LiteralPath $Path -Destination (Join-Path $script:ShotsDir 'latest.png') -Force -ErrorAction SilentlyContinue
-  Write-ManoLog "Captura $Path"; $Path
-}
-function Save-ManoScreenRect {
-  param($Rect, [string]$Path)
-  if ($Path -and $Path -notmatch '(?i)\.png$') { throw (Get-ManoError 'E_SHOT_PATH' @($Path)) }
-  if ($script:DryRun) { return "[dry-run] $(Format-ManoRect $Rect)" }
-  $bmp = New-Object Drawing.Bitmap($Rect.Width, $Rect.Height)
-  $g = [Drawing.Graphics]::FromImage($bmp); $g.CopyFromScreen($Rect.Location, [Drawing.Point]::Empty, $Rect.Size); $g.Dispose()
-  Save-ManoBitmap $bmp $Path
-}
-
-# ---------- clipboard paste (restores the previous text) ----------
-function Invoke-ManoPasteText {
-  param([string]$Text)
-  $old = $null
-  try { if ([Windows.Forms.Clipboard]::ContainsText()) { $old = [Windows.Forms.Clipboard]::GetText() } } catch { $old = $null }
-  [Windows.Forms.Clipboard]::SetText($Text); [Windows.Forms.SendKeys]::SendWait('^v'); Start-Sleep -Milliseconds 120
-  try { if ($null -ne $old) { [Windows.Forms.Clipboard]::SetText($old) } else { [Windows.Forms.Clipboard]::Clear() } } catch { Write-Verbose 'clipboard restore' }
+    Ensure-ManoNative
+    if (-not (Test-Path -LiteralPath $script:TargetFile)) { Throw-ManoError 'No hay ventana objetivo. Usa: use <hwnd|titulo> o elige una en la interfaz (ui).' 1 }
+    $text = (Get-Content -LiteralPath $script:TargetFile -Raw).Trim()
+    $value = [int64]0
+    if (-not [int64]::TryParse($text, [ref]$value)) { Throw-ManoError 'La ventana objetivo guardada no es valida. Vuelve a elegirla.' 1 }
+    $hwnd = [IntPtr]$value
+    if (-not [ManoNative.Win]::IsWindow($hwnd)) { Throw-ManoError 'La ventana objetivo ya no existe. Elige otra.' 1 }
+    $hwnd
 }
 
 # =====================================================================================================
-# 5. Acciones (CLI y batch) / actions (shared by CLI and batch)
+# 4. Utilidades puras (testables) / pure helpers (testable)
 # =====================================================================================================
-function Invoke-ManoFocusCommand {
-  param([string[]]$Arguments)
-  Assert-ManoEnabled; Assert-ManoGuard
-  $q = (@($Arguments) -join ' ').Trim()
-  if (-not $q) { throw (Get-ManoError 'E_USAGE' @('focus <hwnd|titulo>')) }
-  $all = @(Get-ManoWindow)
-  $w = @($all | Where-Object { "$($_.Hwnd)" -eq $q })
-  if (-not $w.Count) { $w = @($all | Where-Object { $_.Titulo.IndexOf($q, [StringComparison]::OrdinalIgnoreCase) -ge 0 }) }
-  if ($w.Count -ne 1) { throw (Get-ManoError 'E_AMBIGUOUS' @($w.Count, $q)) }
-  $h = [IntPtr]$w[0].Hwnd; [void](Assert-ManoAllowed $h); [void](Assert-ManoOnMonitor $h)
-  if (-not $script:BatchApproved) {
-    Register-ManoRate 1
-    $d = "Elegir como ventana objetivo y traerla al frente / select as target and bring to front:`r`n$($w[0].Titulo)`r`nProceso / process: $($w[0].Proceso)"
-    if (-not (Request-ManoPermission $d)) { throw (Get-ManoError 'E_CANCELLED' @('focus')) }
-  }
-  if (-not $script:DryRun) { "$($w[0].Hwnd)" | Set-Content -LiteralPath $script:TargetFile -Encoding ASCII }
-  [void](Invoke-ManoFocus $h); Write-ManoActivity
-  Write-ManoEvent 'HECHO' "focus $($w[0].Hwnd) $($w[0].Titulo)"
-  Get-ManoResult 'focus' "Objetivo: $($w[0].Hwnd) $($w[0].Titulo) $($w[0].Rect)" @{ hwnd = $w[0].Hwnd; title = $w[0].Titulo; process = $w[0].Proceso; rect = $w[0].Rect; browser = $w[0].Navegador }
+function Get-ManoBlockRegex {
+    param([string[]]$Extra = @())
+    $pattern = '(?i)(\blog ?in\b|\bsign ?in\b|\bsign ?up\b|iniciar sesi|inicio de sesi|acceder a tu cuenta|contrase|\bpassword\b|passwort|\b2fa\b|verificaci.n en dos|one-time code|' +
+        'gmail|mail\.google|inbox \(|bandeja de entrada|outlook\.live|' +
+        'paypal|stripe|checkout|\bpago\b|\bpagar\b|payment|billing|facturaci|tarjeta|credit card|\bbank|\bbanco|banca online|bizum|transferencia|wallet|cartera|coinbase|binance|crypto|cripto)'
+    $escaped = @(@($Extra) | Where-Object { $_ } | ForEach-Object { [regex]::Escape([string]$_) })
+    if ($escaped.Count -gt 0) { $pattern = $pattern.TrimEnd(')') + '|' + ($escaped -join '|') + ')' }
+    $pattern
 }
 
-function Invoke-ManoScreenshotCommand {
-  param([string[]]$Arguments)
-  # screenshot [path] | screenshot window [path] | screenshot monitor [name] [path] | screenshot hwnd <hwnd> [path]
-  Assert-ManoEnabled
-  $a = @($Arguments)
-  $mode = if ($a.Count -and $a[0] -in 'window', 'monitor', 'hwnd') { $a[0] } else { 'window' }
-  $rest = if ($a.Count -and $a[0] -in 'window', 'monitor', 'hwnd') { @($a | Select-Object -Skip 1) } else { $a }
-  switch ($mode) {
-    'monitor' {
-      $spec = if ($rest.Count -and $rest[0] -notmatch '(?i)\.png$') { $rest[0] } else { "$($script:Cfg.TargetMonitor)" }
-      $p = @($rest | Where-Object { $_ -match '(?i)\.png$' }) | Select-Object -First 1
-      $m = Find-ManoMonitor $spec; $path = Save-ManoScreenRect $m.Bounds $p
-      return (Get-ManoResult 'screenshot' "Captura monitor $($m.DeviceName): $path" @{ path = $path; rect = (Format-ManoRect $m.Bounds); monitor = $m.DeviceName })
+function Test-ManoTitleBlocked {
+    param([string]$Title, [string[]]$Extra = @())
+    if (-not $Title) { return $false }
+    [bool]($Title -match (Get-ManoBlockRegex -Extra $Extra))
+}
+
+function Convert-ManoKeyCombo {
+    param([string]$Combo)
+    $c = ("$Combo" -replace '\s', '').ToLowerInvariant()
+    if (-not $c) { Throw-ManoError 'Combinacion de teclas vacia. Ejemplo: ctrl+s' 1 }
+    $aliases = @{ escape = 'esc'; esc = 'esc'; supr = 'delete'; del = 'delete'; ins = 'insert'; intro = 'enter'; return = 'enter'; pgup = 'pageup'; pgdn = 'pagedown'; espacio = 'space'; bksp = 'backspace' }
+    $sendMap = @{
+        enter = '{ENTER}'; tab = '{TAB}'; esc = '{ESC}'; backspace = '{BACKSPACE}'; delete = '{DELETE}'
+        insert = '{INSERT}'; up = '{UP}'; down = '{DOWN}'; left = '{LEFT}'; right = '{RIGHT}'
+        home = '{HOME}'; end = '{END}'; pageup = '{PGUP}'; pagedown = '{PGDN}'; space = ' '
     }
-    'hwnd' {
-      if (-not $rest.Count) { throw (Get-ManoError 'E_USAGE' @('screenshot hwnd <hwnd> [ruta.png]')) }
-      $v = 0L; if (-not [long]::TryParse($rest[0], [ref]$v)) { throw (Get-ManoError 'E_BAD_NUMBER' @($rest[0])) }
-      $h = [IntPtr]$v; if (-not [ManoSegura.Native]::IsWindow($h)) { throw (Get-ManoError 'E_HWND_GONE' @($rest[0])) }
-      [void](Assert-ManoAllowed $h); $r = Assert-ManoOnMonitor $h
-      $path = Save-ManoScreenRect $r ($rest | Select-Object -Skip 1 -First 1)
-      return (Get-ManoResult 'screenshot' "Captura ventana: $path" @{ path = $path; rect = (Format-ManoRect $r) })
+    foreach ($i in 1..12) { $sendMap["f$i"] = "{F$i}" }
+
+    $parts = if ($c -eq '+') { @('+') } else { @($c -split '\+') }
+    $mods = New-Object System.Collections.Generic.List[string]
+    $key = ''
+    foreach ($part in $parts) {
+        if (-not $part) { continue }
+        if ($part -in @('ctrl', 'control', 'ctl')) { if (-not $mods.Contains('ctrl')) { $mods.Add('ctrl') }; continue }
+        if ($part -eq 'alt') { if (-not $mods.Contains('alt')) { $mods.Add('alt') }; continue }
+        if ($part -in @('shift', 'mayus')) { if (-not $mods.Contains('shift')) { $mods.Add('shift') }; continue }
+        if ($part -in @('win', 'windows', 'super', 'meta', 'lwin', 'rwin', 'cmd')) { Throw-ManoError 'La tecla Windows no esta permitida.' 1 }
+        $k = if ($aliases.ContainsKey($part)) { $aliases[$part] } else { $part }
+        if (-not ($sendMap.ContainsKey($k) -or $k.Length -eq 1)) { Throw-ManoError "Tecla desconocida: $part" 1 }
+        if ($key) { Throw-ManoError "Combinacion con dos teclas principales: $Combo" 1 }
+        $key = $k
     }
-    default {
-      $h = Get-ManoTarget; [void](Assert-ManoAllowed $h); $r = Assert-ManoOnMonitor $h
-      $path = Save-ManoScreenRect $r ($rest | Select-Object -First 1)
-      return (Get-ManoResult 'screenshot' "Captura: $path  (ventana $($r.Width)x$($r.Height) en $($r.X),$($r.Y))" @{ path = $path; rect = (Format-ManoRect $r) })
+    if (-not $key) { Throw-ManoError "Combinacion sin tecla principal: $Combo" 1 }
+
+    $normalized = (@(@('ctrl', 'alt', 'shift') | Where-Object { $mods.Contains($_) }) + @($key)) -join '+'
+    if ($normalized -in @('ctrl+alt+delete', 'alt+f4', 'ctrl+shift+esc')) { Throw-ManoError "Combinacion bloqueada por seguridad: $normalized" 1 }
+
+    $prefix = ''
+    foreach ($m in @('ctrl', 'alt', 'shift')) {
+        if ($mods.Contains($m)) { $prefix += $(switch ($m) { 'ctrl' { '^' } 'alt' { '%' } 'shift' { '+' } }) }
     }
-  }
+    $keySend = if ($sendMap.ContainsKey($key)) { $sendMap[$key] } else { $key -replace '([+^%~(){}\[\]])', '{$1}' }
+    [pscustomobject]@{ Normalized = $normalized; Mods = [string[]]@($mods); Key = $key; SendKeys = "$prefix$keySend" }
 }
 
-function Invoke-ManoClickCommand {
-  param([string[]]$Arguments)
-  $a = @($Arguments)
-  if ($a.Count -lt 2) { throw (Get-ManoError 'E_USAGE' @('click x y [left|right|double]')) }
-  $x = Get-ManoInt $a[0]; $y = Get-ManoInt $a[1]; $btn = if ($a.Count -gt 2) { $a[2].ToLowerInvariant() } else { 'left' }
-  if ($btn -notin 'left', 'right', 'double') { throw (Get-ManoError 'E_BAD_BUTTON' @($btn)) }
-  Assert-ManoEnabled
-  $r = Assert-ManoOnMonitor (Get-ManoTarget)
-  if ($x -lt 0 -or $y -lt 0 -or $x -ge $r.Width -or $y -ge $r.Height) { throw (Get-ManoError 'E_OUT_OF_WINDOW' @($x, $y, $r.Width, $r.Height)) }
-  $p = Invoke-ManoPrepare "Clic $btn en ($x,$y) de la ventana / $btn click at ($x,$y)"
-  $sx = $p.R.X + $x; $sy = $p.R.Y + $y   # screen coords; negative on a monitor left of / above the primary one
-  if (-not (Test-ManoPointInside $sx $sy (Get-ManoTargetMonitor).Bounds)) { throw (Get-ManoError 'E_POINT_OFF_MONITOR' @($sx, $sy)) }
-  if ($script:DryRun) { return (Get-ManoResult 'click' "[dry-run] clic $btn en pantalla ($sx,$sy)" @{ x = $x; y = $y; screenX = $sx; screenY = $sy; dryRun = $true }) }
-  Assert-ManoForeground $p.H
-  [void][ManoSegura.Native]::SetCursorPos($sx, $sy); Start-Sleep -Milliseconds 30
-  if ($btn -eq 'right') { [ManoSegura.Native]::mouse_event(0x8, 0, 0, 0, [IntPtr]::Zero); [ManoSegura.Native]::mouse_event(0x10, 0, 0, 0, [IntPtr]::Zero) }
-  else {
-    [ManoSegura.Native]::mouse_event(0x2, 0, 0, 0, [IntPtr]::Zero); [ManoSegura.Native]::mouse_event(0x4, 0, 0, 0, [IntPtr]::Zero)
-    if ($btn -eq 'double') { Start-Sleep -Milliseconds 40; [ManoSegura.Native]::mouse_event(0x2, 0, 0, 0, [IntPtr]::Zero); [ManoSegura.Native]::mouse_event(0x4, 0, 0, 0, [IntPtr]::Zero) }
-  }
-  Write-ManoEvent 'HECHO' "clic $btn ($x,$y) -> ($sx,$sy)"
-  Assert-ManoAfterAction $p
-  Get-ManoResult 'click' "OK clic $btn en ($x,$y)" @{ x = $x; y = $y; screenX = $sx; screenY = $sy }
-}
-
-function Invoke-ManoTextCommand {
-  param([string]$Mode, [string[]]$Arguments)
-  $text = (@($Arguments) -join ' ')
-  if (-not $text) { throw (Get-ManoError 'E_USAGE' @("$Mode `"texto`"")) }
-  $verb = if ($Mode -eq 'paste') { 'Pegar el texto (portapapeles + Ctrl+V) / paste' } else { 'Escribir el texto / type' }
-  $p = Invoke-ManoPrepare "$($verb):`r`n`"$(Get-ManoClipped $text)`""
-  Assert-ManoSafeField $p
-  if ($script:DryRun) { return (Get-ManoResult $Mode "[dry-run] $(if ($Mode -eq 'paste') { 'pegaria' } else { 'escribiria' }) $($text.Length) caracteres" @{ chars = $text.Length; dryRun = $true }) }
-  if ($Mode -eq 'paste') {
-    Assert-ManoForeground $p.H
-    Invoke-ManoPasteText $text
-  } else {
-    # Typed in small chunks: between chunks the panic flag and the foreground window are re-checked.
-    for ($i = 0; $i -lt $text.Length; $i += 24) {
-      Assert-ManoForeground $p.H
-      [Windows.Forms.SendKeys]::SendWait((ConvertTo-ManoSendKeyText $text.Substring($i, [math]::Min(24, $text.Length - $i))))
-    }
-  }
-  Write-ManoEvent 'HECHO' "$Mode $($text.Length) caracteres"
-  Assert-ManoAfterAction $p
-  Get-ManoResult $Mode "OK $(if ($Mode -eq 'paste') { 'pegado' } else { 'escrito' }) ($($text.Length) caracteres)" @{ chars = $text.Length }
-}
-
-function Invoke-ManoKeyCommand {
-  param([string[]]$Arguments)
-  $combo = (@($Arguments) -join ''); $parts = ConvertTo-ManoCombo $combo
-  Assert-ManoEnabled
-  $h = Get-ManoTarget; $isB = Test-ManoBrowser (Get-ManoWindowProcess $h) $script:Cfg.ExtraBrowsers
-  $blk = Get-ManoComboBlock $parts $isB ([bool]$script:Cfg.AllowNewTabs)
-  if ($blk) { throw (Get-ManoError $blk.Id @($blk.Arg)) }
-  $p = Invoke-ManoPrepare "Pulsar teclas / press keys: $($parts.Normalized)"
-  Assert-ManoSafeField $p -KeyOnly -Combo $parts.Normalized
-  if ($script:DryRun) { return (Get-ManoResult 'key' "[dry-run] teclas $($parts.Normalized)" @{ keys = $parts.Normalized; dryRun = $true }) }
-  Assert-ManoForeground $p.H
-  [Windows.Forms.SendKeys]::SendWait((ConvertTo-ManoSendKey $parts))
-  Write-ManoEvent 'HECHO' "tecla $($parts.Normalized)"
-  Assert-ManoAfterAction $p
-  Get-ManoResult 'key' "OK tecla $($parts.Normalized)" @{ keys = $parts.Normalized }
-}
-
-function Invoke-ManoScrollCommand {
-  param([string[]]$Arguments)
-  $a = @($Arguments)
-  $amt = if ($a.Count -ge 1) { Get-ManoInt $a[0] } else { -3 }
-  $amt = [math]::Max(-50, [math]::Min(50, $amt))
-  Assert-ManoEnabled
-  $r = Assert-ManoOnMonitor (Get-ManoTarget)
-  $x = if ($a.Count -ge 3) { Get-ManoInt $a[1] } else { [int]($r.Width / 2) }
-  $y = if ($a.Count -ge 3) { Get-ManoInt $a[2] } else { [int]($r.Height / 2) }
-  if ($x -lt 0 -or $y -lt 0 -or $x -ge $r.Width -or $y -ge $r.Height) { throw (Get-ManoError 'E_OUT_OF_WINDOW' @($x, $y, $r.Width, $r.Height)) }
-  $dir = if ($amt -lt 0) { 'abajo / down' } else { 'arriba / up' }
-  $p = Invoke-ManoPrepare "Desplazar / scroll $([math]::Abs($amt)) pasos $dir en ($x,$y)"
-  if ($script:DryRun) { return (Get-ManoResult 'scroll' "[dry-run] scroll $amt" @{ amount = $amt; dryRun = $true }) }
-  Assert-ManoForeground $p.H
-  [void][ManoSegura.Native]::SetCursorPos($p.R.X + $x, $p.R.Y + $y); [ManoSegura.Native]::mouse_event(0x800, 0, 0, 120 * $amt, [IntPtr]::Zero)
-  Write-ManoEvent 'HECHO' "scroll $amt"
-  Assert-ManoAfterAction $p
-  Get-ManoResult 'scroll' "OK scroll $amt" @{ amount = $amt }
-}
-
-function Invoke-ManoWaitCommand {
-  param([string[]]$Arguments)
-  $a = @($Arguments)
-  $ms = if ($a.Count) { Get-ManoInt $a[0] } else { 300 }
-  $ms = [math]::Max(0, [math]::Min(10000, $ms))
-  if (-not $script:DryRun) { for ($left = $ms; $left -gt 0; $left -= 100) { Assert-ManoEnabled; Start-Sleep -Milliseconds ([math]::Min(100, $left)) } }
-  Get-ManoResult 'wait' "OK espera $ms ms" @{ ms = $ms }
-}
-
-function Invoke-ManoNavigateCommand {
-  param([string[]]$Arguments)
-  $url = (@($Arguments) -join ' ').Trim()
-  if (-not $url) { throw (Get-ManoError 'E_USAGE' @('navigate <url>')) }
-  $u = Test-ManoUrl -Url $url -Mode $script:Cfg.Navigation -Allowlist $script:Cfg.UrlAllowlist -ExtraBlocked $script:Cfg.ExtraBlockedUrls
-  if (-not $u.Ok) { throw (Get-ManoError $u.Id @($url)) }
-  Assert-ManoEnabled
-  $h = Get-ManoTarget
-  if (-not (Test-ManoBrowser (Get-ManoWindowProcess $h) $script:Cfg.ExtraBrowsers)) { throw (Get-ManoError 'E_NAV_NOT_BROWSER') }
-  # Outside the allowlist, navigation always asks, even in trust mode.
-  $p = Invoke-ManoPrepare "NAVEGAR a / NAVIGATE to:`r`n$($u.Normalized)" -NoTrust:($u.NeedsExplicitConfirm) -Warning
-  if ($script:DryRun) { return (Get-ManoResult 'navigate' "[dry-run] navegaria a $($u.Normalized)" @{ url = $u.Normalized; dryRun = $true }) }
-  Assert-ManoForeground $p.H
-  [Windows.Forms.SendKeys]::SendWait('^l'); Start-Sleep -Milliseconds 150
-  $fe = $null; try { $fe = [Windows.Automation.AutomationElement]::FocusedElement } catch { $fe = $null }
-  if (-not $fe -or $fe.Current.IsPassword -or -not (Test-ManoAddressBarElement $fe.Current.Name $fe.Current.AutomationId $fe.Current.ClassName)) {
-    [Windows.Forms.SendKeys]::SendWait('{ESC}')
-    throw (Get-ManoError 'E_NAV_NO_ADDRESSBAR')
-  }
-  Assert-ManoForeground $p.H
-  Invoke-ManoPasteText $u.Normalized; [Windows.Forms.SendKeys]::SendWait('{ENTER}')
-  Write-ManoEvent 'HECHO' "navegar $($u.Normalized)"
-  Assert-ManoAfterAction $p -DelayMs 800
-  Get-ManoResult 'navigate' "OK navegando a $($u.Normalized)" @{ url = $u.Normalized }
-}
-
-function Invoke-ManoAction {
-  param([string]$Command, [string[]]$Arguments)
-  switch ($Command) {
-    'focus'      { return (Invoke-ManoFocusCommand $Arguments) }
-    'screenshot' { return (Invoke-ManoScreenshotCommand $Arguments) }
-    'click'      { return (Invoke-ManoClickCommand $Arguments) }
-    'type'       { return (Invoke-ManoTextCommand 'type' $Arguments) }
-    'paste'      { return (Invoke-ManoTextCommand 'paste' $Arguments) }
-    'key'        { return (Invoke-ManoKeyCommand $Arguments) }
-    'scroll'     { return (Invoke-ManoScrollCommand $Arguments) }
-    'wait'       { return (Invoke-ManoWaitCommand $Arguments) }
-    'navigate'   { return (Invoke-ManoNavigateCommand $Arguments) }
-    default      { throw (Get-ManoError 'E_UNKNOWN_CMD' @($Command)) }
-  }
-}
-
-# =====================================================================================================
-# 6. Vigilante de panico (proceso visible) / panic guard (visible process)
-#    Tray icon + banner at the bottom of the target monitor + coloured border around the controlled window.
-# =====================================================================================================
-$script:HotKeyCode = @'
-public class MsHot3 : System.Windows.Forms.NativeWindow {
-  public event System.EventHandler Hot;
-  public MsHot3(System.IntPtr h) { AssignHandle(h); }
-  protected override void WndProc(ref System.Windows.Forms.Message m) { if (m.Msg == 0x0312 && Hot != null) Hot(this, System.EventArgs.Empty); base.WndProc(ref m); }
-}
-'@
-
-function Get-ManoFormsReference {
-  if ($PSVersionTable.PSEdition -eq 'Desktop') { return @('System.Windows.Forms') }
-  $rx = '^(System\.Windows\.Forms(\.Primitives)?|System\.ComponentModel\.Primitives|System\.Runtime|System\.Private\.CoreLib|Microsoft\.Win32\.Primitives)$'
-  @([AppDomain]::CurrentDomain.GetAssemblies() | Where-Object { -not $_.IsDynamic -and $_.Location -and $_.GetName().Name -match $rx } | ForEach-Object { $_.Location })
-}
-
-function Invoke-ManoPanic {
-  Set-Content -LiteralPath $script:DisabledFlag -Value (Get-Date).ToString('o') -Encoding ASCII
-  Remove-Item -LiteralPath $script:TrustFile -Force -ErrorAction SilentlyContinue
-  # Stops ONLY other running ManoSegura commands (never the guard itself, never other programs).
-  Get-CimInstance Win32_Process -Filter "Name='powershell.exe' OR Name='pwsh.exe'" |
-    Where-Object { $_.ProcessId -ne $PID -and $_.CommandLine -match 'ManoSegura\.ps1' -and $_.CommandLine -notmatch '\b_(guard|panic)\b' } |
-    ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
-  Write-ManoEvent 'PANICO' 'acciones detenidas, ManoSegura desactivada / actions stopped, ManoSegura disabled'
-}
-
-function Show-ManoTopmostNoActivate {
-  param($Form, [int]$X, [int]$Y, [int]$Width, [int]$Height)
-  $hw = $Form.Handle
-  # WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW | WS_EX_LAYERED | WS_EX_TRANSPARENT: never steals focus, clicks pass through.
-  $ex = [ManoSegura.Native]::GetWindowLong($hw, -20) -bor 0x080800A0
-  [void][ManoSegura.Native]::SetWindowLong($hw, -20, $ex)
-  [void][ManoSegura.Native]::SetWindowPos($hw, [IntPtr](-1), $X, $Y, $Width, $Height, 0x0050)   # HWND_TOPMOST, SWP_NOACTIVATE | SWP_SHOWWINDOW
-}
-
-function New-ManoPlainForm {
-  [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSUseShouldProcessForStateChangingFunctions', '', Justification = 'Creates an in-memory form only.')]
-  param([Drawing.Color]$Color, [double]$Opacity = 0.9)
-  $f = New-Object Windows.Forms.Form
-  $f.FormBorderStyle = 'None'; $f.ShowInTaskbar = $false; $f.TopMost = $true; $f.StartPosition = 'Manual'; $f.AutoScaleMode = 'None'
-  $f.BackColor = $Color; $f.Opacity = $Opacity; $f.Text = ''; $f.MinimumSize = New-Object Drawing.Size(1, 1)
-  [void]$f.Handle
-  $f
-}
-
-function Update-ManoGuardView {
-  [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSUseShouldProcessForStateChangingFunctions', '', Justification = 'Only repaints the guard''s own banner and border.')]
-  param()
-  $g = $script:Guard
-  $disabled = Test-Path -LiteralPath $script:DisabledFlag
-  $trust = (-not $disabled) -and (Test-ManoTrust)
-  if ($disabled) { $g.Label.Text = 'ManoSegura DESACTIVADA - "enable" para reactivar / DISABLED'; $g.Label.ForeColor = $g.Grey }
-  elseif ($trust) {
-    $until = Get-ManoTrustExpiry (Get-Content -LiteralPath $script:TrustFile -Raw)
-    $hhmm = if ($until) { $until.ToString('HH:mm') } else { '?' }
-    $g.Label.Text = "ManoSegura - MODO CONFIANZA hasta $hhmm - Ctrl+Alt+P = PANICO"; $g.Label.ForeColor = $g.Red
-  } else { $g.Label.Text = 'ManoSegura activa - pide permiso - Ctrl+Alt+P = PANICO'; $g.Label.ForeColor = $g.Orange }
-  $show = $false
-  if (-not $disabled -and $script:Cfg.Overlay -and (Test-Path -LiteralPath $script:TargetFile)) {
-    $v = 0L
-    if ([long]::TryParse((Get-Content -LiteralPath $script:TargetFile -Raw).Trim(), [ref]$v)) {
-      $h = [IntPtr]$v
-      if ([ManoSegura.Native]::IsWindow($h) -and [ManoSegura.Native]::IsWindowVisible($h) -and -not [ManoSegura.Native]::IsIconic($h)) {
-        $edges = Get-ManoOverlayEdge (Get-ManoRect $h) $g.Monitor.Bounds $g.Thickness
-        $key = (($edges | ForEach-Object { "$($_.X),$($_.Y),$($_.Width),$($_.Height)" }) -join ';') + "|$trust"
-        $g.Tick++
-        if ($key -ne $g.EdgeKey -or ($g.Tick % 10 -eq 0)) {   # re-assert topmost every ~3 s
-          $col = if ($trust) { $g.Red } else { $g.Orange }
-          for ($i = 0; $i -lt 4; $i++) { $g.Edges[$i].BackColor = $col; Show-ManoTopmostNoActivate $g.Edges[$i] $edges[$i].X $edges[$i].Y $edges[$i].Width $edges[$i].Height }
-          $g.EdgeKey = $key
-        }
-        $show = $true
-      }
-    }
-  }
-  if (-not $show -and $g.EdgeKey) { foreach ($e in $g.Edges) { [void][ManoSegura.Native]::ShowWindow($e.Handle, 0) }; $g.EdgeKey = '' }
-  # Close quietly after a while without actions (the next action starts the guard again).
-  $last = $g.Started
-  if (Test-Path -LiteralPath $script:ActivityFile) { $t = Get-ManoTrustExpiry (Get-Content -LiteralPath $script:ActivityFile -Raw); if ($t -and $t -gt $last) { $last = $t } }
-  if (-not $trust -and ((Get-Date) - $last).TotalMinutes -gt [int]$script:Cfg.GuardIdleMinutes) {
-    Write-ManoEvent 'VIGILANTE' 'cerrado por inactividad / closed after inactivity'
-    [Windows.Forms.Application]::ExitThread()
-  }
-}
-
-function Invoke-ManoGuardLoop {
-  $created = $false
-  $mtx = New-Object Threading.Mutex($true, $script:MutexPanic, [ref]$created)
-  if (-not $created) { $mtx.Dispose(); return 'Vigilante ya activo / guard already running.' }
-  $g = @{ Edges = @(); EdgeKey = ''; Tick = 0; Started = (Get-Date) }
-  $script:Guard = $g
-  try {
-    if (-not ('MsHot3' -as [type])) { Add-Type -ReferencedAssemblies (Get-ManoFormsReference) -TypeDefinition $script:HotKeyCode }
-    $g.Monitor = Get-ManoTargetMonitor; $s = Get-ManoDpiScale $g.Monitor; $g.Thickness = [int][math]::Max(2, 3 * $s)
-    $g.Orange = [Drawing.Color]::FromArgb(255, 140, 0); $g.Red = [Drawing.Color]::FromArgb(230, 40, 40); $g.Grey = [Drawing.Color]::FromArgb(150, 150, 150)
-    # Banner at the bottom-centre of the target monitor (over the taskbar, so it never covers the app's content).
-    $g.Banner = New-ManoPlainForm ([Drawing.Color]::FromArgb(20, 20, 20)) 0.88
-    $g.Banner.Text = 'ManoSegura'
-    $g.Label = New-Object Windows.Forms.Label
-    $g.Label.Dock = 'Fill'; $g.Label.TextAlign = 'MiddleCenter'; $g.Label.Font = Get-ManoFont (14 * $s) -Bold; $g.Label.ForeColor = $g.Orange
-    $g.Banner.Controls.Add($g.Label)
-    $bw = [int](600 * $s); $bh = [int](28 * $s)
-    $bx = [int]($g.Monitor.Bounds.X + ($g.Monitor.Bounds.Width - $bw) / 2); $by = [int]($g.Monitor.Bounds.Y + $g.Monitor.Bounds.Height - $bh - 2)
-    Show-ManoTopmostNoActivate $g.Banner $bx $by $bw $bh
-    $g.Edges = @(1..4 | ForEach-Object { New-ManoPlainForm $g.Orange 0.85 })
-    # Tray icon with a menu: the visible way to stop everything.
-    $g.Tray = New-Object Windows.Forms.NotifyIcon
-    $g.Tray.Icon = [Drawing.SystemIcons]::Shield; $g.Tray.Text = 'ManoSegura activa - Ctrl+Alt+P = PANICO'; $g.Tray.Visible = $true
-    $menu = New-Object Windows.Forms.ContextMenuStrip
-    [void]$menu.Items.Add('PANICO: desactivar ya / PANIC (Ctrl+Alt+P)', $null, { Invoke-ManoPanic })
-    [void]$menu.Items.Add('Quitar modo confianza / end trust mode', $null, { Revoke-ManoTrust 'menu de la bandeja' })
-    [void]$menu.Items.Add('Abrir registros / open logs', $null, { Start-Process -FilePath 'explorer.exe' -ArgumentList "`"$script:LogsDir`"" })
-    [void]$menu.Items.Add('Cerrar vigilante / close guard', $null, { [Windows.Forms.Application]::ExitThread() })
-    $g.Tray.ContextMenuStrip = $menu
-    $g.Tray.ShowBalloonTip(4000, 'ManoSegura', 'Activa: pide permiso para cada accion. Ctrl+Alt+P = PANICO.', 'Info')
-    # Panic hotkey Ctrl+Alt+P (MOD_CONTROL | MOD_ALT | MOD_NOREPEAT).
-    $g.Hot = New-Object MsHot3($g.Banner.Handle)
-    $g.Hot.add_Hot({
-        Invoke-ManoPanic
-        [void][Windows.Forms.MessageBox]::Show('ManoSegura DESACTIVADA. Acciones pendientes canceladas. / DISABLED, pending actions cancelled.', 'ManoSegura - PANICO', 'OK', 'Warning') })
-    if ([ManoSegura.Native]::RegisterHotKey($g.Banner.Handle, 1, 0x4003, 0x50)) { Write-ManoEvent 'VIGILANTE' 'escuchando Ctrl+Alt+P' }
+function Convert-ManoHotkey {
+    param([string]$Combo)
+    $parsed = Convert-ManoKeyCombo $Combo
+    $mods = 0
+    if ($parsed.Mods -contains 'alt') { $mods = $mods -bor 0x0001 }
+    if ($parsed.Mods -contains 'ctrl') { $mods = $mods -bor 0x0002 }
+    if ($parsed.Mods -contains 'shift') { $mods = $mods -bor 0x0004 }
+    $key = $parsed.Key
+    $vk = -1
+    if ($key.Length -eq 1 -and $key -match '^[a-z0-9]$') { $vk = [int][char]$key.ToUpperInvariant() }
+    elseif ($key -match '^f([1-9]|1[0-2])$') { $vk = 0x70 + ([int]$Matches[1] - 1) }
     else {
-      Write-ManoEvent 'VIGILANTE' 'no pude registrar Ctrl+Alt+P (lo usa otro programa); usa el icono de la bandeja'
-      $g.Tray.ShowBalloonTip(6000, 'ManoSegura', 'Ctrl+Alt+P no disponible: usa el menu del icono de la bandeja para el PANICO.', 'Warning')
+        $map = @{ enter = 0x0D; tab = 0x09; esc = 0x1B; space = 0x20; backspace = 0x08; delete = 0x2E; insert = 0x2D; home = 0x24; end = 0x23; pageup = 0x21; pagedown = 0x22; up = 0x26; down = 0x28; left = 0x25; right = 0x27 }
+        if ($map.ContainsKey($key)) { $vk = $map[$key] }
     }
-    $tm = New-Object Windows.Forms.Timer; $tm.Interval = 300
-    $tm.Add_Tick({ try { Update-ManoGuardView } catch { Write-ManoLog "VIGILANTE error: $($_.Exception.Message)" } })
-    $tm.Start()
-    [Windows.Forms.Application]::Run()
-    $tm.Stop()
-  } finally {
-    if ($g.Banner) { try { [void][ManoSegura.Native]::UnregisterHotKey($g.Banner.Handle, 1) } catch { Write-Verbose 'unregister' } }
-    if ($g.Tray) { $g.Tray.Visible = $false; $g.Tray.Dispose() }
-    foreach ($e in @($g.Edges)) { if ($e) { $e.Dispose() } }
-    if ($g.Banner) { $g.Banner.Dispose() }
-    $mtx.ReleaseMutex(); $mtx.Dispose()
-  }
-  'Vigilante cerrado / guard closed.'
+    if ($vk -lt 0) { Throw-ManoError "No puedo usar '$Combo' como atajo global. Usa letras, numeros o F1-F12." 1 }
+    [pscustomobject]@{ Modifiers = $mods; VirtualKey = $vk; Normalized = $parsed.Normalized }
+}
+
+function Convert-ManoBatch {
+    param([string]$Json, [int]$MaxSteps = 50)
+    try { $obj = $Json | ConvertFrom-Json } catch { Throw-ManoError "batch: JSON no valido: $($_.Exception.Message)" 1 }
+    if ($null -eq $obj) { Throw-ManoError 'batch: JSON vacio.' 1 }
+    $steps = if ($obj -is [array]) { @($obj) } elseif ($null -ne $obj.PSObject.Properties['steps']) { @($obj.steps) } else { @($obj) }
+    $steps = @($steps | Where-Object { $null -ne $_ })
+    if ($steps.Count -eq 0) { Throw-ManoError 'batch: no hay pasos.' 1 }
+    if ($steps.Count -gt $MaxSteps) { Throw-ManoError "batch: maximo $MaxSteps pasos (hay $($steps.Count))." 1 }
+    $allowed = @('focus', 'screenshot', 'click', 'type', 'paste', 'key', 'scroll', 'drag', 'wait')
+    $result = New-Object System.Collections.Generic.List[object]
+    $i = 0
+    foreach ($step in $steps) {
+        $i++
+        if ($null -eq $step.PSObject.Properties['cmd']) { Throw-ManoError "batch: el paso $i no tiene 'cmd'." 1 }
+        $cmd = ([string]$step.cmd).Trim().ToLowerInvariant()
+        if ($cmd -notin $allowed) { Throw-ManoError "batch: paso $i con comando no permitido '$cmd'." 1 }
+        $argsList = New-Object System.Collections.Generic.List[string]
+        if ($null -ne $step.PSObject.Properties['args'] -and $null -ne $step.args) {
+            foreach ($a in @($step.args)) {
+                if ($a -is [string] -or $a -is [ValueType]) { $argsList.Add([string]$a) }
+                else { Throw-ManoError "batch: paso $i con argumentos no validos." 1 }
+            }
+        }
+        $result.Add([pscustomobject]@{ Index = $i; Cmd = $cmd; Args = [string[]]$argsList.ToArray() })
+    }
+    [object[]]$result.ToArray()
+}
+
+function Select-ManoMonitor {
+    param([object[]]$Monitors, [string]$Spec)
+    $all = @($Monitors | Where-Object { $null -ne $_ })
+    if ($all.Count -eq 0) { return $null }
+    $s = "$Spec".Trim()
+    if (-not $s -or $s -in @('primary', 'primario', 'principal')) { return ($all | Where-Object { $_.Primary } | Select-Object -First 1) }
+    if ($s -match '^\d+$') { $i = [int]$s; if ($i -ge 0 -and $i -lt $all.Count) { return $all[$i] }; return $null }
+    if ($s -match '^(?i)(left|izquierda|izq)$') { return ($all | Sort-Object -Property { $_.Bounds.X } | Select-Object -First 1) }
+    if ($s -match '^(?i)(right|derecha|der)$') { return ($all | Sort-Object -Property { $_.Bounds.X } -Descending | Select-Object -First 1) }
+    if ($s -match '^(?i)(?:x=)?(-?\d+)\s*,\s*(-?\d+)$') {
+        $px = [int]$Matches[1]; $py = [int]$Matches[2]
+        return ($all | Where-Object { Test-ManoPointInRect $px $py $_.Bounds } | Select-Object -First 1)
+    }
+    if ($s -match '^(?i)x=(-?\d+)$') {
+        $px = [int]$Matches[1]
+        return ($all | Where-Object { $_.Bounds.X -eq $px } | Select-Object -First 1)
+    }
+    $byName = @($all | Where-Object { $_.DeviceName -eq $s -or $_.DeviceName -like "*\$s" })
+    if ($byName.Count -gt 0) { return $byName[0] }
+    $byId = @($all | Where-Object { $_.MonitorId -and $_.MonitorId.IndexOf($s, [StringComparison]::OrdinalIgnoreCase) -ge 0 })
+    if ($byId.Count -gt 0) { return $byId[0] }
+    $null
+}
+
+function Test-ManoPointInRect {
+    param([int]$X, [int]$Y, $Rect)
+    ($X -ge $Rect.X) -and ($Y -ge $Rect.Y) -and ($X -lt ($Rect.X + $Rect.Width)) -and ($Y -lt ($Rect.Y + $Rect.Height))
+}
+
+function Test-ManoRectInside {
+    param($Inner, $Outer)
+    ($Inner.X -ge $Outer.X) -and ($Inner.Y -ge $Outer.Y) -and
+    (($Inner.X + $Inner.Width) -le ($Outer.X + $Outer.Width)) -and
+    (($Inner.Y + $Inner.Height) -le ($Outer.Y + $Outer.Height))
+}
+
+function Format-ManoRect {
+    param($Rect)
+    "$($Rect.X),$($Rect.Y) $($Rect.Width)x$($Rect.Height)"
 }
 
 # =====================================================================================================
-# 7. Comandos / commands
+# 5. Monitores y ventanas / monitors and windows
 # =====================================================================================================
-$script:HelpText = @'
-ManoSegura {0} - uso / usage:
-  powershell -NoProfile -File .\ManoSegura.ps1 <comando> [args] [--dry-run] [--json] [--en|--es]
-  (sin -ExecutionPolicy Bypass: ver README / no Bypass needed, see README)
-
-  version | monitors | list-windows | status | config | start-panic
-  focus <hwnd|titulo>                        elegir ventana objetivo (pide permiso)
-  screenshot [ruta.png]                      captura la ventana objetivo
-  screenshot monitor [nombre|n] [ruta.png]   captura un monitor (por defecto el objetivo)
-  screenshot hwnd <hwnd> [ruta.png]          captura otra ventana
-  click x y [left|right|double]              coords relativas a la ventana
-  type "texto"  |  paste "texto"             (rechaza campos de contrasena y la barra de direcciones)
-  key ctrl+a | enter | tab ...               (bloquea Win, Alt+F4, Alt+Tab; en navegadores Ctrl+L, Ctrl+T, Ctrl+N...)
-  scroll [pasos(-abajo/+arriba)] [x y]
-  wait [ms]
-  navigate <url>                             navegar en el navegador objetivo (segun Navigation / UrlAllowlist)
-  batch <steps.json|->                       un permiso para toda la lista (max. 50 pasos)
-  check-title "titulo" | check-url <url> | check-key <combo> [browser]     prueba las reglas
-  verify-log                                 comprueba la cadena de hashes del registro de auditoria
-  disable | enable | trust-off               Panico: Ctrl+Alt+P
-Codigos de salida / exit codes: 0 OK, 2 rechazado/error, 3 cancelado por el usuario, 4 limite de velocidad
-Config: config.json (ver config.example.json y README)
-'@
-
-# Commands that never touch the screen (they also work off Windows, e.g. in CI).
-$script:NativeFree = @('version', 'help', '--help', '-h', '/?', 'config', 'check-title', 'check-url', 'check-key', 'verify-log', 'disable', 'trust-off')
-
-function Invoke-ManoBatchCommand {
-  param([string[]]$Arguments)
-  $a = @($Arguments)
-  if (-not $a.Count) { throw (Get-ManoError 'E_USAGE' @('batch <steps.json|->')) }
-  $steps = @(ConvertFrom-ManoBatch (Read-ManoBatchSource ($a -join ' ')) $script:MaxBatchSteps)
-  Assert-ManoEnabled; Assert-ManoGuard
-  $summary = ($steps | ForEach-Object { "$($_.Index). $($_.Cmd) $(Get-ManoClipped ($_.Args -join ' ') 120)" }) -join "`r`n"
-  $needsTarget = @($steps | Where-Object { $_.Cmd -in 'click', 'type', 'paste', 'key', 'scroll', 'navigate' -or ($_.Cmd -eq 'screenshot' -and -not ($_.Args.Count -and $_.Args[0] -in 'monitor', 'hwnd')) }).Count -gt 0
-  if ($needsTarget -and $steps[0].Cmd -ne 'focus') { $h = Get-ManoTarget; $t = Assert-ManoAllowed $h; $summary += "`r`nVentana / window: $t" }
-  # Every step is validated before asking: bad keys and forbidden URLs fail now, not half-way through.
-  $explicit = $false
-  foreach ($st in $steps) {
-    if ($st.Cmd -eq 'key') { [void](ConvertTo-ManoCombo ($st.Args -join '')) }
-    if ($st.Cmd -eq 'navigate') {
-      $u = Test-ManoUrl -Url ($st.Args -join ' ') -Mode $script:Cfg.Navigation -Allowlist $script:Cfg.UrlAllowlist -ExtraBlocked $script:Cfg.ExtraBlockedUrls
-      if (-not $u.Ok) { throw (Get-ManoError $u.Id @($st.Args -join ' ')) }
-      if ($u.NeedsExplicitConfirm) { $explicit = $true }
+function Get-ManoMonitors {
+    Ensure-ManoNative
+    $list = New-Object System.Collections.Generic.List[object]
+    foreach ($screen in [System.Windows.Forms.Screen]::AllScreens) {
+        $dd = New-Object ManoNative.DISPLAY_DEVICE
+        $dd.cb = [Runtime.InteropServices.Marshal]::SizeOf($dd)
+        $ids = New-Object System.Collections.Generic.List[string]
+        $i = 0
+        while ([ManoNative.Win]::EnumDisplayDevices($screen.DeviceName, $i, [ref]$dd, 0)) {
+            $ids.Add("$($dd.DeviceID) $($dd.DeviceString)")
+            $i++
+        }
+        $list.Add([pscustomobject]@{
+                DeviceName = $screen.DeviceName
+                Bounds     = $screen.Bounds
+                Primary    = $screen.Primary
+                MonitorId  = ($ids -join ' ; ')
+            })
     }
-  }
-  Register-ManoRate (Get-ManoActionCount $steps)
-  if (-not (Request-ManoPermission "Ejecutar / run $($steps.Count) pasos:`r`n$summary" -NoTrust:$explicit -Warning:$explicit)) { throw (Get-ManoError 'E_CANCELLED' @('batch')) }
-  $script:BatchApproved = $true
-  try {
-    foreach ($st in $steps) {
-      Assert-ManoEnabled
-      $r = Invoke-ManoAction $st.Cmd $st.Args
-      $r.message = "[$($st.Index)/$($steps.Count)] $($r.message)"
-      $script:Partial.Add($r)
-    }
-  } finally { $script:BatchApproved = $false }
-  Write-ManoEvent 'HECHO' "batch $($steps.Count) pasos"
-  Get-ManoResult 'batch' "OK batch ($($steps.Count) pasos)" @{ steps = $steps.Count }
+    [object[]]$list.ToArray()
 }
 
-function Invoke-ManoCommand {
-  param([string]$Command, [string[]]$Arguments)
-  $a = @($Arguments)
-  switch ($Command) {
-    { $_ -in '_guard', '_panic' } { return (Invoke-ManoGuardLoop) }
-    'version' { return (Get-ManoResult 'version' "ManoSegura $script:Version" @{ version = $script:Version }) }
-    'config' { return [pscustomobject]$script:Cfg }
-    'monitors' {
-      $tm = Get-ManoTargetMonitor; $i = 0
-      return @(foreach ($mo in Get-ManoMonitor) {
-          [pscustomobject][ordered]@{ Indice = $i; Nombre = $mo.DeviceName; Rect = (Format-ManoRect $mo.Bounds); Escala = [math]::Round((Get-ManoDpiScale $mo), 2)
-            Primario = $mo.Primary; Objetivo = ($mo.DeviceName -eq $tm.DeviceName); Id = $mo.MonitorId }
-          $i++
+function Get-ManoTargetMonitor {
+    $monitors = Get-ManoMonitors
+    $monitor = Select-ManoMonitor -Monitors $monitors -Spec ([string]$script:Cfg.TargetMonitor)
+    if ($null -eq $monitor) {
+        Throw-ManoError "No encuentro el monitor '$($script:Cfg.TargetMonitor)'. Usa: monitors" 1
+    }
+    $monitor
+}
+
+function Get-ManoWindowRect {
+    param([IntPtr]$Hwnd)
+    Ensure-ManoNative
+    $r = New-Object ManoNative.RECT
+    $ok = $false
+    try { if ([ManoNative.Win]::DwmGetWindowAttribute($Hwnd, 9, [ref]$r, 16) -eq 0) { $ok = $true } } catch { }
+    if (-not $ok) { [void][ManoNative.Win]::GetWindowRect($Hwnd, [ref]$r) }
+    [System.Drawing.Rectangle]::FromLTRB($r.Left, $r.Top, $r.Right, $r.Bottom)
+}
+
+function Get-ManoWindowTitle {
+    param([IntPtr]$Hwnd)
+    Ensure-ManoNative
+    $sb = New-Object System.Text.StringBuilder 512
+    [void][ManoNative.Win]::GetWindowText($Hwnd, $sb, 512)
+    $sb.ToString()
+}
+
+function Get-ManoWindows {
+    Ensure-ManoNative
+    $list = New-Object System.Collections.ArrayList
+    $callback = [ManoNative.Win+EnumProc] {
+        param($h, $p)
+        [void]$p
+        if ([ManoNative.Win]::IsWindowVisible($h)) { [void]$list.Add($h) }
+        $true
+    }
+    [void][ManoNative.Win]::EnumWindows($callback, [IntPtr]::Zero)
+    $target = Get-ManoTargetMonitor
+    $processNames = @{}
+    foreach ($p in (Get-Process -ErrorAction SilentlyContinue)) { $processNames[[uint32]$p.Id] = $p.ProcessName }
+    $result = New-Object System.Collections.Generic.List[object]
+    foreach ($h in $list) {
+        $title = Get-ManoWindowTitle $h
+        if (-not $title) { continue }
+        $procId = [uint32]0
+        [void][ManoNative.Win]::GetWindowThreadProcessId($h, [ref]$procId)
+        $rect = Get-ManoWindowRect $h
+        $processName = $processNames[$procId]
+        $result.Add([pscustomobject]@{
+                Hwnd       = [int64]$h
+                Proceso    = $processName
+                Titulo     = $title
+                Rect       = $rect
+                Monitor    = if (Test-ManoRectInside $rect $target.Bounds) { $target.DeviceName } else { '' }
+                EnObjetivo = Test-ManoRectInside $rect $target.Bounds
+                Bloqueada  = Test-ManoTitleBlocked -Title $title -Extra $script:Cfg.BlockedTitles
+            })
+    }
+    [object[]]$result.ToArray()
+}
+
+function Find-ManoWindow {
+    param([string]$Query)
+    $q = "$Query".Trim()
+    if (-not $q) { Throw-ManoError 'Uso: use <hwnd|parte del titulo>' 1 }
+    $windows = Get-ManoWindows
+    $byHandle = @($windows | Where-Object { "$($_.Hwnd)" -eq $q })
+    if ($byHandle.Count -eq 1) { return $byHandle[0] }
+    $byTitle = @($windows | Where-Object { $_.Titulo -like "*$q*" })
+    if ($byTitle.Count -eq 1) { return $byTitle[0] }
+    $byProcess = @($windows | Where-Object { $_.Proceso -like "*$q*" })
+    if ($byProcess.Count -eq 1) { return $byProcess[0] }
+    if ($byTitle.Count -gt 1) {
+        $choices = ($byTitle | ForEach-Object { "$($_.Hwnd)  $($_.Titulo)" }) -join [Environment]::NewLine
+        Throw-ManoError "Hay $($byTitle.Count) ventanas que coinciden con '$q'. Usa el hwnd:`n$choices" 1
+    }
+    Throw-ManoError "No encuentro ninguna ventana que coincida con '$q'. Prueba: list" 1
+}
+
+function Assert-ManoWindowAllowed {
+    param([IntPtr]$Hwnd)
+    $title = Get-ManoWindowTitle $Hwnd
+    if ($script:Cfg.BlockSensitiveWindows -and (Test-ManoTitleBlocked -Title $title -Extra $script:Cfg.BlockedTitles)) {
+        Throw-ManoError "Ventana PROHIBIDA por seguridad (login, contrasena, correo, pagos): '$title'" 2
+    }
+    $title
+}
+
+function Assert-ManoWindowOnMonitor {
+    param([IntPtr]$Hwnd)
+    $rect = Get-ManoWindowRect $Hwnd
+    $target = Get-ManoTargetMonitor
+    if (-not (Test-ManoRectInside $rect $target.Bounds)) {
+        Throw-ManoError "La ventana ($(Format-ManoRect $rect)) no esta entera en el monitor objetivo $($target.DeviceName) ($(Format-ManoRect $target.Bounds)). Muevela alli o cambia TargetMonitor." 1
+    }
+    $rect
+}
+
+# =====================================================================================================
+# 6. Confirmacion / confirmation
+# =====================================================================================================
+function Confirm-ManoAction {
+    param([string]$Description, [switch]$NoTrust)
+
+    if ($script:DryRun) {
+        Write-ManoLog "[dry-run] pediria permiso: $(Get-ManoClipped ($Description -replace "`r`n", ' | ') 300)"
+        Write-Output "[dry-run] pediria permiso: $(Get-ManoClipped ($Description -replace "`r`n", ' | ') 300)"
+        return $true
+    }
+    if ($script:AutoYes) {
+        Write-ManoLog "AUTO (--yes): $(Get-ManoClipped ($Description -replace "`r`n", ' | ') 300)"
+        return $true
+    }
+    if (-not $NoTrust -and (Test-ManoTrustActive)) {
+        Write-ManoLog "AUTO (modo confianza): $(Get-ManoClipped ($Description -replace "`r`n", ' | ') 300)"
+        return $true
+    }
+    if ($script:Cfg.ConfirmMode -eq 'auto') {
+        Write-ManoLog "AUTO (ConfirmMode=auto): $(Get-ManoClipped ($Description -replace "`r`n", ' | ') 300)"
+        return $true
+    }
+
+    Ensure-ManoNative
+    $monitor = Get-ManoTargetMonitor
+    $timeout = [int]$script:Cfg.ConfirmTimeoutSec
+    $form = New-Object System.Windows.Forms.Form
+    $form.Text = 'ManoSegura - permiso'
+    $form.TopMost = $true
+    $form.FormBorderStyle = 'None'
+    $form.ShowInTaskbar = $false
+    $form.StartPosition = 'Manual'
+    $form.Size = New-Object System.Drawing.Size(640, 380)
+    $form.BackColor = Get-ManoUiColor 'Bg'
+    $form.ForeColor = Get-ManoUiColor 'Text'
+    $form.Location = New-Object System.Drawing.Point(($monitor.Bounds.X + [int](($monitor.Bounds.Width - 640) / 2)), ($monitor.Bounds.Y + [int](($monitor.Bounds.Height - 380) / 2)))
+    $accent = New-Object System.Windows.Forms.Panel
+    $accent.Dock = 'Top'
+    $accent.Height = 4
+    $accent.BackColor = Get-ManoUiColor 'Warn'
+    $form.Controls.Add($accent)
+    [void](New-ManoUiLabel -Parent $form -Text 'Permiso necesario' -X 24 -Y 24 -W 400 -H 28 -Size 15 -Bold)
+    [void](New-ManoUiLabel -Parent $form -Text 'Un asistente quiere hacer esto en la ventana objetivo:' -X 24 -Y 56 -W 580 -H 20 -Size 9 -Color 'Muted')
+    $label = New-Object System.Windows.Forms.TextBox
+    $label.Multiline = $true
+    $label.ReadOnly = $true
+    $label.ScrollBars = 'Vertical'
+    $label.BorderStyle = 'None'
+    $label.BackColor = Get-ManoUiColor 'Card'
+    $label.ForeColor = Get-ManoUiColor 'Text'
+    $label.Location = New-Object System.Drawing.Point(24, 84)
+    $label.Size = New-Object System.Drawing.Size(592, 120)
+    $label.Font = New-Object System.Drawing.Font('Segoe UI', 9.5)
+    $label.Text = $Description
+    $form.Controls.Add($label)
+
+    $check = New-Object System.Windows.Forms.CheckBox
+    $check.Location = New-Object System.Drawing.Point(24, 220)
+    $check.Size = New-Object System.Drawing.Size(250, 24)
+    $check.Text = 'Modo confianza durante (min):'
+    $check.ForeColor = Get-ManoUiColor 'Text'
+    $check.BackColor = Get-ManoUiColor 'Bg'
+    $numeric = New-Object System.Windows.Forms.NumericUpDown
+    $numeric.Location = New-Object System.Drawing.Point(280, 220)
+    $numeric.Size = New-Object System.Drawing.Size(70, 26)
+    $numeric.Minimum = 1
+    $numeric.Maximum = [int]$script:Cfg.TrustMaxMinutes
+    $numeric.Value = [math]::Min(10, [int]$script:Cfg.TrustMaxMinutes)
+    $numeric.BackColor = Get-ManoUiColor 'CardAlt'
+    $numeric.ForeColor = Get-ManoUiColor 'Text'
+    $numeric.BorderStyle = 'FixedSingle'
+    if ($NoTrust) { $check.Enabled = $false; $numeric.Enabled = $false }
+    $form.Controls.AddRange(@($check, $numeric))
+
+    $count = New-Object System.Windows.Forms.Label
+    $count.Location = New-Object System.Drawing.Point(24, 258)
+    $count.Size = New-Object System.Drawing.Size(300, 20)
+    $count.ForeColor = Get-ManoUiColor 'Muted'
+    $count.BackColor = Get-ManoUiColor 'Bg'
+    $form.Controls.Add($count)
+
+    $ok = New-ManoUiButton -Parent $form -Text 'Permitir' -X 492 -Y 312 -W 124 -H 40 -Kind primary
+    $cancel = New-ManoUiButton -Parent $form -Text 'Cancelar' -X 364 -Y 312 -W 118 -H 40 -Kind subtle
+
+    $script:ConfirmResult = $false
+    $script:ConfirmLeft = $timeout
+    $ok.Add_Click({ $script:ConfirmResult = $true; $form.Close() })
+    $cancel.Add_Click({ $form.Close() })
+    $timer = New-Object System.Windows.Forms.Timer
+    $timer.Interval = 1000
+    $timer.Add_Tick({
+            $script:ConfirmLeft--
+            $count.Text = "Se cancela solo en $($script:ConfirmLeft) s"
+            if ($script:ConfirmLeft -le 0 -or (Test-ManoDisabled)) { $form.Close() }
         })
+    $form.CancelButton = $cancel
+    $count.Text = "Se cancela solo en $timeout s"
+    $form.Add_Shown({ $form.Activate(); $cancel.Focus() })
+    $timer.Start()
+    [void]$form.ShowDialog()
+    $timer.Stop()
+    $form.Dispose()
+
+    if (Test-ManoDisabled) { $script:ConfirmResult = $false }
+    if ($script:ConfirmResult -and $check.Checked) { [void](Set-ManoTrustMinutes ([int]$numeric.Value)) }
+    $verdict = if ($script:ConfirmResult) { 'PERMITIDO' } else { 'CANCELADO' }
+    Write-ManoLog "$verdict : $(Get-ManoClipped ($Description -replace "`r`n", ' | ') 300)"
+    [bool]$script:ConfirmResult
+}
+
+
+function Focus-ManoWindow {
+    param([IntPtr]$Hwnd)
+    Ensure-ManoNative
+    if ([ManoNative.Win]::GetForegroundWindow() -eq $Hwnd) { return $true }
+    if ($script:DryRun) { return $true }
+    if ([ManoNative.Win]::IsIconic($Hwnd)) { [void][ManoNative.Win]::ShowWindow($Hwnd, 9) }
+    $foreground = [ManoNative.Win]::GetForegroundWindow()
+    $me = [ManoNative.Win]::GetCurrentThreadId()
+    $t1 = [ManoNative.Win]::GetWindowThreadProcessId($foreground, [IntPtr]::Zero)
+    $t2 = [ManoNative.Win]::GetWindowThreadProcessId($Hwnd, [IntPtr]::Zero)
+    [void][ManoNative.Win]::AttachThreadInput($me, $t1, $true)
+    [void][ManoNative.Win]::AttachThreadInput($me, $t2, $true)
+    try {
+        [ManoNative.Win]::keybd_event(0x12, 0, 0, [IntPtr]::Zero)
+        [ManoNative.Win]::keybd_event(0x12, 0, 2, [IntPtr]::Zero)
+        [void][ManoNative.Win]::BringWindowToTop($Hwnd)
+        [void][ManoNative.Win]::SetForegroundWindow($Hwnd)
+    } finally {
+        [void][ManoNative.Win]::AttachThreadInput($me, $t1, $false)
+        [void][ManoNative.Win]::AttachThreadInput($me, $t2, $false)
     }
-    'list-windows' { return @(Get-ManoWindow) }
-    'status' {
-      $tm = Get-ManoTargetMonitor; $m = $null
-      $tgt = '(ninguno)'
-      if (Test-Path -LiteralPath $script:TargetFile) { $v = 0L; if ([long]::TryParse((Get-Content -LiteralPath $script:TargetFile -Raw).Trim(), [ref]$v)) { $tgt = "$v  $(Get-ManoTitle ([IntPtr]$v))" } }
-      return [pscustomobject][ordered]@{
-        Version = $script:Version; Desactivada = (Test-Path -LiteralPath $script:DisabledFlag); ModoConfianza = (Test-ManoTrust)
-        MonitorObjetivo = "$($tm.DeviceName) $(Format-ManoRect $tm.Bounds)"; Objetivo = $tgt; Navegacion = $script:Cfg.Navigation
-        PestanasNuevas = $script:Cfg.AllowNewTabs; LimitePorMinuto = $script:Cfg.MaxActionsPerMinute; Capturas = $script:ShotsDir
-        PanicoEscuchando = [Threading.Mutex]::TryOpenExisting($script:MutexPanic, [ref]$m)
-      }
+    for ($i = 0; $i -lt 15; $i++) {
+        if ([ManoNative.Win]::GetForegroundWindow() -eq $Hwnd) { return $true }
+        Start-Sleep -Milliseconds 20
     }
-    'start-panic' { Assert-ManoGuard; return (Get-ManoResult 'start-panic' 'Vigilante de panico (Ctrl+Alt+P) activo: icono en la bandeja y cartel en el monitor.') }
-    'batch' { return (Invoke-ManoBatchCommand $a) }
-    'enable' {
-      if (-not (Test-Path -LiteralPath $script:DisabledFlag)) { return (Get-ManoResult 'enable' 'Ya estaba activada. / Already enabled.') }
-      # The flag stays in place until the user confirms; trust mode never applies here.
-      if (Request-ManoPermission 'REACTIVAR ManoSegura despues del boton de panico / RE-ENABLE after panic' -NoTrust -IgnoreDisabled -Warning) {
-        if (-not $script:DryRun) { Remove-Item -LiteralPath $script:DisabledFlag -Force }
-        Write-ManoEvent 'REACTIVADA' 'por el usuario'
-        return (Get-ManoResult 'enable' 'Reactivada. / Re-enabled.')
-      }
-      return (Get-ManoResult 'enable' 'Sigue desactivada. / Still disabled.')
+    $false
+}
+
+function Assert-ManoNotPasswordField {
+    if ($script:DryRun) { return }
+    Ensure-ManoNative
+    try { $focused = [System.Windows.Automation.AutomationElement]::FocusedElement } catch { $focused = $null }
+    if ($null -eq $focused) { Throw-ManoError 'No puedo comprobar el campo enfocado; no escribo.' 1 }
+    $isPassword = $false
+    try { $isPassword = $focused.Current.IsPassword } catch { $isPassword = $false }
+    if ($isPassword) { Throw-ManoError 'El campo enfocado es de CONTRASENA. Nunca escribo ahi.' 2 }
+}
+
+function Prepare-ManoAction {
+    param([string]$Description)
+    Ensure-ManoNative
+    if (Test-ManoDisabled) { Throw-ManoError 'ManoSegura esta DESACTIVADA (boton de panico). Usa: enable' 2 }
+    $hwnd = Get-ManoTarget
+    $title = Assert-ManoWindowAllowed $hwnd
+    [void](Assert-ManoWindowOnMonitor $hwnd)
+    if (-not $script:BatchApproved) {
+        if (-not (Confirm-ManoAction "$Description`r`nVentana: $title")) { Throw-ManoError "CANCELADO: $Description" 2 }
     }
-    'disable' {
-      Set-Content -LiteralPath $script:DisabledFlag -Value (Get-Date).ToString('o') -Encoding ASCII
-      Remove-Item -LiteralPath $script:TrustFile -Force -ErrorAction SilentlyContinue
-      Write-ManoEvent 'DESACTIVADA' 'por comando'
-      return (Get-ManoResult 'disable' 'Desactivada. / Disabled.')
-    }
-    'trust-off' { Revoke-ManoTrust 'trust-off'; return (Get-ManoResult 'trust-off' 'Modo confianza desactivado. / Trust mode off.') }
-    'check-title' {
-      $t = $a -join ' '; $b = Test-ManoBlockedTitle $t @($script:Cfg.ExtraBlockedTitles)
-      return (Get-ManoResult 'check-title' $(if ($b) { "BLOQUEADA: $t" } else { "permitida: $t" }) @{ title = $t; blocked = $b })
-    }
-    'check-url' {
-      $raw = $a -join ' '
-      # With Navigation = off every URL is refused; still show what the hard rules would say.
-      $mode = if ($script:Cfg.Navigation -eq 'off') { $script:Notes.Add('Navigation = off: navigate esta desactivado / navigate is disabled'); 'ask' } else { $script:Cfg.Navigation }
-      $u = Test-ManoUrl -Url $raw -Mode $mode -Allowlist $script:Cfg.UrlAllowlist -ExtraBlocked $script:Cfg.ExtraBlockedUrls
-      $msg = if ($u.Ok) { "permitida: $($u.Normalized)$(if ($u.NeedsExplicitConfirm) { ' (siempre pedira permiso / always asks)' })" }
-             else { "BLOQUEADA [$($u.Id)]: $(Select-ManoLanguage (Get-ManoText $u.Id @($raw)))" }
-      return (Get-ManoResult 'check-url' $msg @{ url = $raw; allowed = $u.Ok; reason = $u.Id; normalized = $u.Normalized; inAllowlist = $u.InAllowlist })
-    }
-    'check-key' {
-      if (-not $a.Count) { throw (Get-ManoError 'E_USAGE' @('check-key <combo> [browser]')) }
-      $isB = ($a.Count -gt 1 -and $a[-1] -in 'browser', 'navegador')
-      $parts = ConvertTo-ManoCombo $a[0]; $blk = Get-ManoComboBlock $parts $isB ([bool]$script:Cfg.AllowNewTabs)
-      $msg = if ($blk) { "BLOQUEADA: $(Select-ManoLanguage (Get-ManoText $blk.Id @($blk.Arg)))" } else { "permitida: $($parts.Normalized)" }
-      return (Get-ManoResult 'check-key' $msg @{ keys = $parts.Normalized; browser = $isB; allowed = ($null -eq $blk) })
-    }
-    'verify-log' {
-      $lines = @(); if (Test-Path -LiteralPath $script:AuditFile) { $lines = @(Get-Content -LiteralPath $script:AuditFile -Encoding UTF8) }
-      $head = ''; if (Test-Path -LiteralPath $script:AuditHead) { $head = @((Get-Content -LiteralPath $script:AuditHead -Raw).Trim() -split ' ')[-1] }
-      $v = Test-ManoAuditChain $lines $head
-      if (-not $v.Ok) { throw (Get-ManoError 'E_AUDIT_BROKEN' @($v.BrokenAt, $v.Reason)) }
-      return (Get-ManoResult 'verify-log' "Registro de auditoria integro: $($v.Count) entradas. / Audit log intact." @{ entries = $v.Count })
-    }
-    { $_ -in 'help', '--help', '-h', '/?' } { return ($script:HelpText -f $script:Version) }
-    { $_ -in $script:BatchCommands } { return (Invoke-ManoAction $Command $a) }
-    default { throw (Get-ManoError 'E_UNKNOWN_CMD' @($Command)) }
-  }
+    if (Test-ManoDisabled) { Throw-ManoError 'ManoSegura esta DESACTIVADA.' 2 }
+    if (-not (Focus-ManoWindow $hwnd)) { Throw-ManoError 'No pude traer la ventana objetivo al frente.' 1 }
+    [void](Assert-ManoWindowAllowed $hwnd)
+    [pscustomobject]@{ Hwnd = $hwnd; Rect = (Get-ManoWindowRect $hwnd); Title = $title }
 }
 
 # =====================================================================================================
-# 8. Main
+# 8. Capturas e input / screenshots and input
 # =====================================================================================================
-if ($script:IsLibrary) { return }
+function Save-ManoBitmap {
+    param($Bitmap, [string]$Path)
 
-$parsed = ConvertFrom-ManoArgument (@($Cmd) + @($Rest))
-$script:DryRun   = $parsed.DryRun -or ($env:MANOSEGURA_DRYRUN -eq '1')
-$script:JsonMode = $parsed.Json -or ($env:MANOSEGURA_JSON -eq '1')
-$argv = @($parsed.Rest)
-$command = if ($argv.Count) { "$($argv[0])".ToLowerInvariant() } else { 'help' }
-$cmdArgs = [string[]]@($argv | Select-Object -Skip 1)
-$exitCode = 0; $results = @(); $err = $null
-$script:KnownCommands = @($script:NativeFree) + @($script:BatchCommands) + @('_guard', '_panic', 'monitors', 'list-windows', 'status', 'start-panic', 'batch', 'enable')
-try {
-  if ($command -notin $script:KnownCommands) { throw (Get-ManoError 'E_UNKNOWN_CMD' @($command)) }
-  Initialize-ManoPath -Root $script:Root
-  $script:Lang = if ($parsed.Lang) { $parsed.Lang } else { $script:Cfg.Language }
-  if ($command -notin $script:NativeFree) {
-    if (-not (Test-ManoWindowsHost)) { throw (Get-ManoError 'E_NOT_WINDOWS') }
-    Initialize-ManoNative
-  }
-  if ($command -notin '_guard', '_panic', 'help', 'version', 'status', 'config', 'verify-log') {
-    Write-ManoEvent 'CMD' "$command $(Get-ManoClipped ($cmdArgs -join ' '))$(if ($script:DryRun) { ' [dry-run]' })"
-  }
-  $results = @(Invoke-ManoCommand $command $cmdArgs)
-} catch [ManoError] {
-  $e = $_.Exception; $exitCode = $e.Code
-  $err = [ordered]@{ id = $e.Id; code = $e.Code; es = $e.Es; en = $e.En }
-  if ($script:LogFile) { Write-ManoEvent $(if ($e.Code -eq 3) { 'CANCELADO' } else { 'RECHAZADO' }) "[$($e.Id)] $($e.Es)" }
-} catch {
-  $exitCode = 1; $t = Get-ManoText 'E_INTERNAL' @($_.Exception.Message)
-  $err = [ordered]@{ id = 'E_INTERNAL'; code = 1; es = $t.Es; en = $t.En }
-  if ($script:LogFile) { Write-ManoEvent 'EXCEPCION' "$($_.Exception.Message) @ linea $($_.InvocationInfo.ScriptLineNumber)" }
+    if (-not $Path) {
+        $ext = if ($script:Cfg.ShotFormat -eq 'jpg') { 'jpg' } else { 'png' }
+        $Path = Join-Path $script:ShotsDir ("shot_{0:yyyyMMdd_HHmmss_fff}.{1}" -f (Get-Date), $ext)
+    }
+    $format = if ($Path -match '(?i)\.jpe?g$') { [System.Drawing.Imaging.ImageFormat]::Jpeg } else { [System.Drawing.Imaging.ImageFormat]::Png }
+    $Bitmap.Save($Path, $format)
+    $Bitmap.Dispose()
+    Copy-Item -LiteralPath $Path -Destination (Join-Path $script:ShotsDir 'latest.png') -Force -ErrorAction SilentlyContinue
+    Write-ManoLog "captura $Path"
+    $Path
 }
 
-$all = @(@($script:Partial.ToArray()) + @($results) | Where-Object { $null -ne $_ })
-if ($script:JsonMode) {
-  $o = [ordered]@{ ok = ($exitCode -eq 0); version = $script:Version; command = $command; dryRun = $script:DryRun; exitCode = $exitCode; results = @($all); notes = @($script:Notes.ToArray()) }
-  if ($err) { $o.error = $err }
-  ConvertTo-ManoJson $o
-} else {
-  foreach ($n in $script:Notes) { $n }
-  Format-ManoText $all
-  if ($err) { "ERROR [$($err.id)]: $(Select-ManoLanguage ([pscustomobject]@{ Es = $err.es; En = $err.en }))" }
+function Save-ManoScreenRect {
+    param($Rect, [string]$Path)
+    if ($script:DryRun) { return "[dry-run] capturaria $(Format-ManoRect $Rect)" }
+    $bitmap = New-Object System.Drawing.Bitmap($Rect.Width, $Rect.Height)
+    $graphics = [System.Drawing.Graphics]::FromImage($bitmap)
+    $graphics.CopyFromScreen($Rect.Location, [System.Drawing.Point]::Empty, $Rect.Size)
+    $graphics.Dispose()
+    Save-ManoBitmap -Bitmap $bitmap -Path $Path
 }
-exit $exitCode
+
+function Invoke-ManoClick {
+    param([int]$X, [int]$Y, [string]$Button = 'left')
+    $prepared = Prepare-ManoAction "Clic $Button en ($X,$Y)"
+    $rect = $prepared.Rect
+    if ($X -lt 0 -or $Y -lt 0 -or $X -ge $rect.Width -or $Y -ge $rect.Height) { Throw-ManoError "($X,$Y) esta fuera de la ventana ($($rect.Width)x$($rect.Height))." 1 }
+    $screenX = $rect.X + $X
+    $screenY = $rect.Y + $Y
+    $target = Get-ManoTargetMonitor
+    if (-not (Test-ManoPointInRect $screenX $screenY $target.Bounds)) { Throw-ManoError 'El punto no esta en el monitor objetivo.' 1 }
+    if ($script:DryRun) { return "[dry-run] clic $Button en pantalla ($screenX,$screenY)" }
+    [void][ManoNative.Win]::SetCursorPos($screenX, $screenY)
+    Start-Sleep -Milliseconds ([int]$script:Cfg.ClickDelayMs)
+    switch ($Button) {
+        'right' {
+            [ManoNative.Win]::mouse_event(0x0008, 0, 0, 0, [IntPtr]::Zero)
+            [ManoNative.Win]::mouse_event(0x0010, 0, 0, 0, [IntPtr]::Zero)
+        }
+        'double' {
+            [ManoNative.Win]::mouse_event(0x0002, 0, 0, 0, [IntPtr]::Zero)
+            [ManoNative.Win]::mouse_event(0x0004, 0, 0, 0, [IntPtr]::Zero)
+            Start-Sleep -Milliseconds 40
+            [ManoNative.Win]::mouse_event(0x0002, 0, 0, 0, [IntPtr]::Zero)
+            [ManoNative.Win]::mouse_event(0x0004, 0, 0, 0, [IntPtr]::Zero)
+        }
+        default {
+            [ManoNative.Win]::mouse_event(0x0002, 0, 0, 0, [IntPtr]::Zero)
+            [ManoNative.Win]::mouse_event(0x0004, 0, 0, 0, [IntPtr]::Zero)
+        }
+    }
+    Write-ManoLog "HECHO clic $Button ($X,$Y) -> ($screenX,$screenY)"
+    "OK clic $Button en ($X,$Y)"
+}
+
+function Invoke-ManoTypeText {
+    param([string]$Text)
+    if ([string]::IsNullOrEmpty($Text)) { Throw-ManoError 'Uso: type "texto"' 1 }
+    [void](Prepare-ManoAction "Escribir el texto:`r`n`"$(Get-ManoClipped $Text 200)`"")
+    Assert-ManoNotPasswordField
+    if ($script:DryRun) { return "[dry-run] escribiria $($Text.Length) caracteres" }
+    $escaped = ($Text -replace '([+^%~(){}\[\]])', '{$1}') -replace "`r?`n", '{ENTER}'
+    [System.Windows.Forms.SendKeys]::SendWait($escaped)
+    Write-ManoLog "HECHO escribir $($Text.Length) caracteres"
+    "OK escrito ($($Text.Length) caracteres)"
+}
+
+function Invoke-ManoPasteText {
+    param([string]$Text)
+    if ([string]::IsNullOrEmpty($Text)) { Throw-ManoError 'Uso: paste "texto"' 1 }
+    [void](Prepare-ManoAction "Pegar el texto (portapapeles + Ctrl+V):`r`n`"$(Get-ManoClipped $Text 200)`"")
+    Assert-ManoNotPasswordField
+    if ($script:DryRun) { return "[dry-run] pegaria $($Text.Length) caracteres" }
+    $old = $null
+    try { if ([System.Windows.Forms.Clipboard]::ContainsText()) { $old = [System.Windows.Forms.Clipboard]::GetText() } } catch { }
+    [System.Windows.Forms.Clipboard]::SetText($Text)
+    [System.Windows.Forms.SendKeys]::SendWait('^v')
+    Start-Sleep -Milliseconds 120
+    try { if ($null -ne $old) { [System.Windows.Forms.Clipboard]::SetText($old) } else { [System.Windows.Forms.Clipboard]::Clear() } } catch { }
+    Write-ManoLog "HECHO pegar $($Text.Length) caracteres"
+    "OK pegado ($($Text.Length) caracteres)"
+}
+
+function Invoke-ManoKeyCombo {
+    param([string]$Combo)
+    $parsed = Convert-ManoKeyCombo $Combo
+    [void](Prepare-ManoAction "Pulsar teclas: $Combo")
+    if ($script:DryRun) { return "[dry-run] teclas $Combo" }
+    [System.Windows.Forms.SendKeys]::SendWait($parsed.SendKeys)
+    Write-ManoLog "HECHO tecla $Combo"
+    "OK tecla $Combo"
+}
+
+function Invoke-ManoScroll {
+    param([int]$Steps = -3, [int]$X = -1, [int]$Y = -1)
+    $hwnd = Get-ManoTarget
+    $rect = Assert-ManoWindowOnMonitor $hwnd
+    if ($X -lt 0) { $X = [int]($rect.Width / 2) }
+    if ($Y -lt 0) { $Y = [int]($rect.Height / 2) }
+    if ($X -lt 0 -or $Y -lt 0 -or $X -ge $rect.Width -or $Y -ge $rect.Height) { Throw-ManoError 'Punto fuera de la ventana.' 1 }
+    $direction = if ($Steps -lt 0) { 'abajo' } else { 'arriba' }
+    $prepared = Prepare-ManoAction "Desplazar $([math]::Abs($Steps)) pasos hacia $direction en ($X,$Y)"
+    if ($script:DryRun) { return "[dry-run] scroll $Steps" }
+    [void][ManoNative.Win]::SetCursorPos($prepared.Rect.X + $X, $prepared.Rect.Y + $Y)
+    [ManoNative.Win]::mouse_event(0x0800, 0, 0, 120 * $Steps, [IntPtr]::Zero)
+    Write-ManoLog "HECHO scroll $Steps"
+    "OK scroll $Steps"
+}
+
+function Invoke-ManoDrag {
+    param([int]$FromX, [int]$FromY, [int]$ToX, [int]$ToY)
+    $prepared = Prepare-ManoAction "Arrastrar de ($FromX,$FromY) a ($ToX,$ToY)"
+    $rect = $prepared.Rect
+    foreach ($point in @(@($FromX, $FromY), @($ToX, $ToY))) {
+        if ($point[0] -lt 0 -or $point[1] -lt 0 -or $point[0] -ge $rect.Width -or $point[1] -ge $rect.Height) {
+            Throw-ManoError "($($point[0]),$($point[1])) esta fuera de la ventana." 1
+        }
+    }
+    if ($script:DryRun) { return "[dry-run] arrastraria de ($FromX,$FromY) a ($ToX,$ToY)" }
+    $startX = $rect.X + $FromX
+    $startY = $rect.Y + $FromY
+    $endX = $rect.X + $ToX
+    $endY = $rect.Y + $ToY
+    [void][ManoNative.Win]::SetCursorPos($startX, $startY)
+    Start-Sleep -Milliseconds 30
+    [ManoNative.Win]::mouse_event(0x0002, 0, 0, 0, [IntPtr]::Zero)
+    $steps = 12
+    for ($i = 1; $i -le $steps; $i++) {
+        $x = [int]($startX + (($endX - $startX) * $i / $steps))
+        $y = [int]($startY + (($endY - $startY) * $i / $steps))
+        [void][ManoNative.Win]::SetCursorPos($x, $y)
+        Start-Sleep -Milliseconds 15
+    }
+    [ManoNative.Win]::mouse_event(0x0004, 0, 0, 0, [IntPtr]::Zero)
+    Write-ManoLog "HECHO drag ($FromX,$FromY)->($ToX,$ToY)"
+    "OK arrastrado a ($ToX,$ToY)"
+}
+
+function Invoke-ManoScreenshot {
+    param([string]$Mode = 'window', [string]$Path = '', [string]$MonitorSpec = '', [string]$HwndText = '')
+
+    Ensure-ManoNative
+    switch ($Mode) {
+        'monitor' {
+            $spec = if ($MonitorSpec) { $MonitorSpec } else { [string]$script:Cfg.TargetMonitor }
+            $monitor = Select-ManoMonitor -Monitors (Get-ManoMonitors) -Spec $spec
+            if ($null -eq $monitor) { Throw-ManoError "No encuentro el monitor '$spec'. Usa: monitors" 1 }
+            return "Captura monitor $($monitor.DeviceName): $(Save-ManoScreenRect $monitor.Bounds $Path)"
+        }
+        'hwnd' {
+            if (-not $HwndText) { Throw-ManoError 'Uso: shot --hwnd <hwnd> [ruta]' 1 }
+            $value = [int64]0
+            if (-not [int64]::TryParse($HwndText, [ref]$value)) { Throw-ManoError "hwnd no valido: $HwndText" 1 }
+            $hwnd = [IntPtr]$value
+            if (-not [ManoNative.Win]::IsWindow($hwnd)) { Throw-ManoError 'Ese hwnd no existe.' 1 }
+            [void](Assert-ManoWindowAllowed $hwnd)
+            $rect = Assert-ManoWindowOnMonitor $hwnd
+            return "Captura ventana: $(Save-ManoScreenRect $rect $Path)"
+        }
+        default {
+            $hwnd = Get-ManoTarget
+            $title = Assert-ManoWindowAllowed $hwnd
+            $rect = Assert-ManoWindowOnMonitor $hwnd
+            if (-not $script:BatchApproved -and -not (Test-ManoTrustActive) -and $script:Cfg.ConfirmMode -ne 'auto' -and -not $script:DryRun -and -not $script:AutoYes) {
+                if (-not (Confirm-ManoAction "Capturar la ventana '$(Get-ManoClipped $title 120)'")) { Throw-ManoError 'CANCELADO: captura' 2 }
+            }
+            return "Captura: $(Save-ManoScreenRect $rect $Path)  (ventana $($rect.Width)x$($rect.Height) en $($rect.X),$($rect.Y))"
+        }
+    }
+}
+
+# =====================================================================================================
+# 9. Acciones / actions
+# =====================================================================================================
+function Invoke-ManoAction {
+    param([string]$Action, [string[]]$ActionArgs = @())
+
+    $a = @($ActionArgs)
+    switch ($Action.ToLowerInvariant()) {
+        'focus' {
+            if ($a.Count -lt 1) { Throw-ManoError 'Uso: focus <hwnd|titulo>' 1 }
+            $window = Find-ManoWindow ($a -join ' ')
+            $hwnd = [IntPtr][int64]$window.Hwnd
+            [void](Assert-ManoWindowAllowed $hwnd)
+            [void](Assert-ManoWindowOnMonitor $hwnd)
+            if (-not $script:BatchApproved) {
+                if (-not (Confirm-ManoAction "Elegir ventana objetivo: $($window.Titulo)")) { Throw-ManoError 'CANCELADO: focus' 2 }
+            }
+            Set-ManoTarget $hwnd
+            [void](Focus-ManoWindow $hwnd)
+            "OK objetivo: $($window.Hwnd)  $($window.Titulo)"
+        }
+        'screenshot' {
+            $mode = 'window'; $path = ''; $monitorSpec = ''; $hwndText = ''
+            for ($i = 0; $i -lt $a.Count; $i++) {
+                switch -Regex ($a[$i]) {
+                    '^--monitor$' { if ($i + 1 -lt $a.Count) { $mode = 'monitor'; $monitorSpec = $a[++$i] } }
+                    '^--hwnd$' { if ($i + 1 -lt $a.Count) { $mode = 'hwnd'; $hwndText = $a[++$i] } }
+                    '^--format$' {
+                        if ($i + 1 -lt $a.Count) {
+                            $f = $a[++$i].TrimStart('.').ToLowerInvariant()
+                            if ($f -in @('png', 'jpg', 'jpeg')) { $script:Cfg.ShotFormat = if ($f -eq 'jpeg') { 'jpg' } else { $f } }
+                        }
+                    }
+                    '^--' { }
+                    default { if (-not $path) { $path = $a[$i] } }
+                }
+            }
+            Invoke-ManoScreenshot -Mode $mode -Path $path -MonitorSpec $monitorSpec -HwndText $hwndText
+        }
+        'click' {
+            if ($a.Count -lt 2) { Throw-ManoError 'Uso: click x y [left|right|double]' 1 }
+            $button = if ($a.Count -ge 3) { $a[2].ToLowerInvariant() } else { 'left' }
+            if ($button -notin @('left', 'right', 'double')) { Throw-ManoError "Boton no valido: $button (left/right/double)" 1 }
+            Invoke-ManoClick -X ([int]$a[0]) -Y ([int]$a[1]) -Button $button
+        }
+        'type' { Invoke-ManoTypeText ($a -join ' ') }
+        'paste' { Invoke-ManoPasteText ($a -join ' ') }
+        'key' { Invoke-ManoKeyCombo ($a -join '') }
+        'scroll' {
+            $steps = if ($a.Count -ge 1) { [int]$a[0] } else { -3 }
+            $x = if ($a.Count -ge 3) { [int]$a[1] } else { -1 }
+            $y = if ($a.Count -ge 3) { [int]$a[2] } else { -1 }
+            Invoke-ManoScroll -Steps $steps -X $x -Y $y
+        }
+        'drag' {
+            if ($a.Count -lt 4) { Throw-ManoError 'Uso: drag x1 y1 x2 y2' 1 }
+            Invoke-ManoDrag -FromX ([int]$a[0]) -FromY ([int]$a[1]) -ToX ([int]$a[2]) -ToY ([int]$a[3])
+        }
+        'wait' {
+            $ms = if ($a.Count -ge 1) { [int]$a[0] } else { 300 }
+            if ($ms -lt 0) { $ms = 0 }
+            if ($ms -gt 10000) { $ms = 10000 }
+            if (-not $script:DryRun) { Start-Sleep -Milliseconds $ms }
+            "OK espera $ms ms"
+        }
+        default { Throw-ManoError "Accion desconocida: $Action" 1 }
+    }
+}
+
+function Invoke-ManoBatchFile {
+    param([string]$Source)
+    $json = if ($Source -eq '-') { [Console]::In.ReadToEnd() } elseif (Test-Path -LiteralPath $Source) { Get-Content -LiteralPath $Source -Raw -Encoding UTF8 } else { $Source }
+    $steps = Convert-ManoBatch -Json $json -MaxSteps ([int]$script:Cfg.MaxBatchSteps)
+    if (Test-ManoDisabled) { Throw-ManoError 'ManoSegura esta DESACTIVADA.' 2 }
+    $needsTarget = @($steps | Where-Object { $_.Cmd -in @('click', 'type', 'paste', 'key', 'scroll', 'drag') -or ($_.Cmd -eq 'screenshot' -and -not ($_.Args.Count -and ($_.Args[0] -in @('--monitor', '--hwnd')))) }).Count -gt 0
+    if ($needsTarget -and $steps[0].Cmd -ne 'focus') { [void](Get-ManoTarget) }
+    $summary = ($steps | ForEach-Object { "$($_.Index). $($_.Cmd) $(Get-ManoClipped ($_.Args -join ' ') 120)" }) -join "`r`n"
+    if (-not (Confirm-ManoAction "Ejecutar $($steps.Count) pasos:`r`n$summary")) { Throw-ManoError 'CANCELADO: batch' 2 }
+    $script:BatchApproved = $true
+    try {
+        foreach ($step in $steps) {
+            if (Test-ManoDisabled) { Throw-ManoError 'PANICO: batch detenido.' 2 }
+            $result = Invoke-ManoAction -Action $step.Cmd -ActionArgs $step.Args
+            "[$($step.Index)/$($steps.Count)] $result"
+        }
+    } finally {
+        $script:BatchApproved = $false
+    }
+    Write-ManoLog "HECHO batch $($steps.Count) pasos"
+    "OK batch ($($steps.Count) pasos)"
+}
+
+# =====================================================================================================
+# 10. Panico / panic
+# =====================================================================================================
+function Invoke-ManoPanic {
+    Set-ManoDisabled -Disabled $true
+    Clear-ManoTrust
+    Write-ManoLog 'PANICO: acciones detenidas y ManoSegura desactivada'
+    if ($script:Gui -and $script:Gui.Form -and -not $script:Gui.Form.IsDisposed) {
+        Update-ManoGuiStatus
+    }
+    'PANICO: ManoSegura desactivada. Usa "enable" (o el boton Activar) para volver.'
+}
+
+# =====================================================================================================
+# 11. Interfaz grafica / graphical interface
+# =====================================================================================================
+# =====================================================================================================
+# 11. Interfaz grafica / graphical interface (tema oscuro moderno)
+# =====================================================================================================
+$script:Palette = @{
+    Bg         = '#0B0F14'
+    Side       = '#080B10'
+    Card       = '#141B24'
+    CardAlt    = '#1B2430'
+    Text       = '#E8EEF5'
+    Muted      = '#8FA1B5'
+    Accent     = '#3DDC97'
+    AccentText = '#052016'
+    Danger     = '#E5484D'
+    Warn       = '#F5A524'
+    Border     = '#222C38'
+}
+
+function Get-ManoUiColor {
+    param([string]$Name)
+    [System.Drawing.ColorTranslator]::FromHtml($script:Palette[$Name])
+}
+
+function New-ManoUiLabel {
+    param($Parent, [string]$Text, [int]$X, [int]$Y, [int]$W, [int]$H, [double]$Size = 9.5, [switch]$Bold, [string]$Color = 'Text')
+    $label = New-Object System.Windows.Forms.Label
+    $label.Text = $Text
+    $label.Location = New-Object System.Drawing.Point($X, $Y)
+    $label.Size = New-Object System.Drawing.Size($W, $H)
+    $fontStyle = if ($Bold) { [System.Drawing.FontStyle]::Bold } else { [System.Drawing.FontStyle]::Regular }
+    $label.Font = New-Object System.Drawing.Font('Segoe UI', $Size, $fontStyle)
+    $label.ForeColor = Get-ManoUiColor $Color
+    $label.BackColor = [System.Drawing.Color]::Transparent
+    $Parent.Controls.Add($label)
+    $label
+}
+
+function New-ManoUiButton {
+    param($Parent, [string]$Text, [int]$X, [int]$Y, [int]$W, [int]$H, [string]$Kind = 'ghost', [scriptblock]$OnClick)
+    $button = New-Object System.Windows.Forms.Button
+    $button.Text = $Text
+    $button.Location = New-Object System.Drawing.Point($X, $Y)
+    $button.Size = New-Object System.Drawing.Size($W, $H)
+    $button.FlatStyle = 'Flat'
+    $button.FlatAppearance.BorderSize = 0
+    $button.UseVisualStyleBackColor = $false
+    $button.Cursor = 'Hand'
+    $button.TextAlign = 'MiddleCenter'
+    $button.Font = New-Object System.Drawing.Font('Segoe UI', 9.5, [System.Drawing.FontStyle]::Regular)
+    switch ($Kind) {
+        'primary' {
+            $button.BackColor = Get-ManoUiColor 'Accent'
+            $button.ForeColor = Get-ManoUiColor 'AccentText'
+            $button.Font = New-Object System.Drawing.Font('Segoe UI', 9.5, [System.Drawing.FontStyle]::Bold)
+            $button.FlatAppearance.MouseOverBackColor = [System.Drawing.Color]::FromArgb(247, 248, 250)
+            $button.FlatAppearance.MouseDownBackColor = [System.Drawing.Color]::FromArgb(211, 255, 233)
+        }
+        'danger' {
+            $button.BackColor = Get-ManoUiColor 'Danger'
+            $button.ForeColor = [System.Drawing.Color]::White
+            $button.Font = New-Object System.Drawing.Font('Segoe UI', 9.5, [System.Drawing.FontStyle]::Bold)
+            $button.FlatAppearance.MouseOverBackColor = [System.Drawing.Color]::FromArgb(240, 90, 94)
+            $button.FlatAppearance.MouseDownBackColor = [System.Drawing.Color]::FromArgb(190, 45, 50)
+        }
+        'subtle' {
+            $button.BackColor = Get-ManoUiColor 'CardAlt'
+            $button.ForeColor = Get-ManoUiColor 'Text'
+            $button.FlatAppearance.BorderColor = Get-ManoUiColor 'Border'
+            $button.FlatAppearance.BorderSize = 1
+            $button.FlatAppearance.MouseOverBackColor = [System.Drawing.Color]::FromArgb(32, 42, 54)
+        }
+        default {
+            $button.BackColor = Get-ManoUiColor 'CardAlt'
+            $button.ForeColor = Get-ManoUiColor 'Text'
+            $button.FlatAppearance.MouseOverBackColor = [System.Drawing.Color]::FromArgb(32, 42, 54)
+            $button.FlatAppearance.MouseDownBackColor = [System.Drawing.Color]::FromArgb(25, 34, 44)
+        }
+    }
+    if ($OnClick) { $button.Add_Click($OnClick) }
+    $Parent.Controls.Add($button)
+    $button
+}
+
+function New-ManoUiCard {
+    param($Parent, [string]$Title, [int]$X, [int]$Y, [int]$W, [int]$H)
+    $card = New-Object System.Windows.Forms.Panel
+    $card.Location = New-Object System.Drawing.Point($X, $Y)
+    $card.Size = New-Object System.Drawing.Size($W, $H)
+    $card.BackColor = Get-ManoUiColor 'Card'
+    $accent = New-Object System.Windows.Forms.Panel
+    $accent.Location = New-Object System.Drawing.Point(0, 0)
+    $accent.Size = New-Object System.Drawing.Size(3, $H)
+    $accent.BackColor = Get-ManoUiColor 'Accent'
+    $card.Controls.Add($accent)
+    if ($Title) { [void](New-ManoUiLabel -Parent $card -Text $Title -X 14 -Y 10 -W ($W - 28) -H 22 -Size 11 -Bold -Color 'Text') }
+    $Parent.Controls.Add($card)
+    $card
+}
+
+function Update-ManoGuiStatus {
+    if (-not $script:Gui -or -not $script:Gui.Form -or $script:Gui.Form.IsDisposed) { return }
+    $g = $script:Gui
+    $disabled = Test-ManoDisabled
+    $trust = Test-ManoTrustActive
+    $targetText = '(ninguna)'
+    try {
+        if (Test-Path -LiteralPath $script:TargetFile) {
+            $value = [int64]0
+            if ([int64]::TryParse((Get-Content -LiteralPath $script:TargetFile -Raw).Trim(), [ref]$value)) {
+                $hwnd = [IntPtr]$value
+                if ([ManoNative.Win]::IsWindow($hwnd)) { $targetText = "$value  $(Get-ManoWindowTitle $hwnd)" }
+            }
+        }
+    } catch { }
+    $monitorText = '?'
+    try {
+        $monitor = Get-ManoTargetMonitor
+        $monitorText = "$($monitor.DeviceName) $(Format-ManoRect $monitor.Bounds)"
+    } catch { }
+    if ($disabled) {
+        $stateText = 'DESACTIVADA'
+        $stateColor = Get-ManoUiColor 'Danger'
+    } elseif ($trust) {
+        $stateText = 'CONFIANZA'
+        $stateColor = Get-ManoUiColor 'Warn'
+    } else {
+        $stateText = 'ACTIVA'
+        $stateColor = Get-ManoUiColor 'Accent'
+    }
+    if ($trust) {
+        $expiry = Get-ManoTrustExpiry (Get-Content -LiteralPath $script:TrustFile -Raw -ErrorAction SilentlyContinue)
+        if ($expiry) { $stateText += '  ' + $expiry.ToString('HH:mm') }
+    }
+    if ($g.SideState) {
+        $g.SideState.Text = $stateText
+        $g.SideState.ForeColor = $stateColor
+    }
+    if ($g.SideTarget) { $g.SideTarget.Text = 'Ventana: ' + (Get-ManoClipped $targetText 40) }
+    if ($g.SideMonitor) { $g.SideMonitor.Text = 'Monitor: ' + (Get-ManoClipped $monitorText 34) }
+    if ($g.SideHotkey) { $g.SideHotkey.Text = 'Panico: ' + $script:Cfg.PanicHotkey }
+    if ($g.TopTrust) {
+        $g.TopTrust.Text = if ($trust) { 'Quitar confianza' } else { 'Confiar 10 min' }
+        $g.TopTrust.BackColor = if ($trust) { Get-ManoUiColor 'Warn' } else { Get-ManoUiColor 'CardAlt' }
+        $g.TopTrust.ForeColor = if ($trust) { Get-ManoUiColor 'AccentText' } else { Get-ManoUiColor 'Text' }
+    }
+    if ($g.TopActivate) { $g.TopActivate.Enabled = $disabled; $g.TopActivate.Visible = $disabled }
+    if ($g.Panic) { $g.Panic.Enabled = -not $disabled }
+    if ($g.StatusLabel) {
+        $g.StatusLabel.Text = 'Estado: ' + $stateText + '   |   Ventana: ' + (Get-ManoClipped $targetText 60) + '   |   Monitor: ' + $monitorText
+    }
+}
+
+function Show-ManoOverlayEdges {
+    param($Rect, [System.Drawing.Color]$Color)
+    if (-not $script:Gui) { return }
+    $g = $script:Gui
+    if (-not $g.OverlayForms) {
+        $forms = New-Object System.Collections.Generic.List[object]
+        foreach ($i in 1..4) {
+            $f = New-Object ManoForms.NoActivateForm
+            $f.FormBorderStyle = 'None'
+            $f.ShowInTaskbar = $false
+            $f.TopMost = $true
+            $f.StartPosition = 'Manual'
+            $f.BackColor = $Color
+            $f.Opacity = 0.92
+            $forms.Add($f)
+        }
+        $g.OverlayForms = $forms
+    }
+    $thickness = 4
+    $top = New-Object System.Drawing.Rectangle($Rect.X, $Rect.Y, $Rect.Width, $thickness)
+    $bottom = New-Object System.Drawing.Rectangle($Rect.X, ($Rect.Y + $Rect.Height - $thickness), $Rect.Width, $thickness)
+    $left = New-Object System.Drawing.Rectangle($Rect.X, $Rect.Y, $thickness, $Rect.Height)
+    $right = New-Object System.Drawing.Rectangle(($Rect.X + $Rect.Width - $thickness), $Rect.Y, $thickness, $Rect.Height)
+    $rects = @($top, $bottom, $left, $right)
+    for ($i = 0; $i -lt 4; $i++) {
+        $f = $g.OverlayForms[$i]
+        $f.BackColor = $Color
+        $f.Bounds = $rects[$i]
+        if (-not $f.Visible) { $f.Show() }
+    }
+    $g.OverlayShown = $true
+}
+
+function Hide-ManoOverlay {
+    if (-not $script:Gui -or -not $script:Gui.OverlayForms) { return }
+    foreach ($f in $script:Gui.OverlayForms) {
+        if ($f.Visible) { $f.Hide() }
+    }
+    $script:Gui.OverlayShown = $false
+}
+
+function Update-ManoOverlay {
+    if (-not $script:Gui -or -not $script:Gui.Form -or $script:Gui.Form.IsDisposed) { return }
+    $show = $false
+    if ($script:Cfg.Overlay -and -not (Test-ManoDisabled)) {
+        try {
+            if (Test-Path -LiteralPath $script:TargetFile) {
+                $hwnd = Get-ManoTarget
+                if ([ManoNative.Win]::IsWindowVisible($hwnd) -and -not [ManoNative.Win]::IsIconic($hwnd)) {
+                    $rect = Get-ManoWindowRect $hwnd
+                    $color = if (Test-ManoTrustActive) { Get-ManoUiColor 'Danger' } else { Get-ManoUiColor 'Warn' }
+                    Show-ManoOverlayEdges -Rect $rect -Color $color
+                    $show = $true
+                }
+            }
+        } catch { }
+    }
+    if (-not $show) { Hide-ManoOverlay }
+}
+
+function Update-ManoGuiWindowList {
+    if (-not $script:Gui -or -not $script:Gui.Form -or $script:Gui.Form.IsDisposed) { return }
+    $g = $script:Gui
+    if (-not $g.WindowGrid) { return }
+    try {
+        $windows = Get-ManoWindows
+        $filter = ([string]$g.FilterBox.Text).Trim()
+        $g.WindowGrid.SuspendLayout()
+        $g.WindowGrid.Rows.Clear()
+        foreach ($window in $windows) {
+            if ($filter -and ($window.Titulo -notlike "*$filter*") -and ($window.Proceso -notlike "*$filter*")) { continue }
+            $process = if ($window.Proceso) { [string]$window.Proceso } else { '?' }
+            $monitor = if ($window.Monitor) { [string]$window.Monitor } else { '-' }
+            $blocked = if ($window.Bloqueada) { 'SI' } else { '' }
+            $index = $g.WindowGrid.Rows.Add("$($window.Hwnd)", $process, $window.Titulo, $monitor, $blocked)
+            $row = $g.WindowGrid.Rows[$index]
+            $row.Tag = $window.Hwnd
+            if ($window.Bloqueada) { $row.DefaultCellStyle.ForeColor = Get-ManoUiColor 'Danger' }
+        }
+        $g.WindowGrid.ResumeLayout()
+        $g.LastRefresh = Get-Date
+        if ($g.CountLabel) { $g.CountLabel.Text = "$($g.WindowGrid.Rows.Count) ventanas" }
+    } catch {
+        try { $g.WindowGrid.ResumeLayout() } catch { }
+    }
+}
+
+function Show-ManoInputDialog {
+    param([string]$Title, [string]$Label, [string]$DefaultValue = '')
+    Ensure-ManoNative
+    $form = New-Object System.Windows.Forms.Form
+    $form.Text = $Title
+    $form.Size = New-Object System.Drawing.Size(460, 190)
+    $form.StartPosition = 'CenterScreen'
+    $form.FormBorderStyle = 'FixedDialog'
+    $form.MaximizeBox = $false
+    $form.MinimizeBox = $false
+    $form.TopMost = $true
+    $form.BackColor = Get-ManoUiColor 'Bg'
+    $form.ForeColor = Get-ManoUiColor 'Text'
+    [void](New-ManoUiLabel -Parent $form -Text $Label -X 16 -Y 16 -W 420 -H 22 -Size 9.5)
+    $box = New-Object System.Windows.Forms.TextBox
+    $box.Location = New-Object System.Drawing.Point(16, 44)
+    $box.Size = New-Object System.Drawing.Size(412, 26)
+    $box.BackColor = Get-ManoUiColor 'Card'
+    $box.ForeColor = Get-ManoUiColor 'Text'
+    $box.BorderStyle = 'FixedSingle'
+    $box.Text = $DefaultValue
+    $form.Controls.Add($box)
+    $ok = New-ManoUiButton -Parent $form -Text 'Aceptar' -X 246 -Y 96 -W 88 -H 34 -Kind primary
+    $ok.DialogResult = [System.Windows.Forms.DialogResult]::OK
+    $cancel = New-ManoUiButton -Parent $form -Text 'Cancelar' -X 340 -Y 96 -W 88 -H 34 -Kind subtle
+    $cancel.DialogResult = [System.Windows.Forms.DialogResult]::Cancel
+    $form.AcceptButton = $ok
+    $form.CancelButton = $cancel
+    $result = $form.ShowDialog()
+    $value = $box.Text
+    $form.Dispose()
+    if ($result -eq [System.Windows.Forms.DialogResult]::OK) { $value } else { $null }
+}
+
+function Invoke-ManoGuiAction {
+    param([scriptblock]$Script, [object[]]$Arguments = @())
+    if (-not $script:Gui -or -not $script:Gui.Form) { return }
+    try {
+        $output = & $Script @Arguments
+        if ($output) { $script:Gui.LogBox.AppendText("$output" + [Environment]::NewLine) }
+        Update-ManoGuiStatus
+        Update-ManoOverlay
+    } catch [ManoError] {
+        [void][System.Windows.Forms.MessageBox]::Show($_.Exception.Message, 'ManoSegura', 'OK', 'Warning')
+        $script:Gui.LogBox.AppendText('ERROR: ' + $_.Exception.Message + [Environment]::NewLine)
+    } catch {
+        [void][System.Windows.Forms.MessageBox]::Show($_.Exception.Message, 'ManoSegura - error', 'OK', 'Error')
+        $script:Gui.LogBox.AppendText('ERROR: ' + $_.Exception.Message + [Environment]::NewLine)
+    }
+    $script:Gui.LogBox.SelectionStart = $script:Gui.LogBox.TextLength
+    $script:Gui.LogBox.ScrollToCaret()
+}
+
+function Show-ManoSection {
+    param([string]$Name)
+    if (-not $script:Gui) { return }
+    $g = $script:Gui
+    foreach ($key in $g.Sections.Keys) {
+        $g.Sections[$key].Visible = ($key -eq $Name)
+    }
+    foreach ($entry in $g.NavItems) {
+        $active = ($entry.Name -eq $Name)
+        $entry.Button.BackColor = if ($active) { Get-ManoUiColor 'Card' } else { Get-ManoUiColor 'Side' }
+        $entry.Button.ForeColor = if ($active) { Get-ManoUiColor 'Text' } else { Get-ManoUiColor 'Muted' }
+        $entry.Bar.Visible = $active
+    }
+    if ($g.HeaderTitle) { $g.HeaderTitle.Text = $g.SectionTitles[$Name] }
+    if ($g.HeaderSub) { $g.HeaderSub.Text = $g.SectionSubtitles[$Name] }
+    $g.ActiveSection = $Name
+}
+
+function New-ManoNavItem {
+    param($Parent, [string]$Name, [string]$Text, [int]$Y)
+    $holder = New-Object System.Windows.Forms.Panel
+    $holder.Location = New-Object System.Drawing.Point(0, $Y)
+    $holder.Size = New-Object System.Drawing.Size(236, 46)
+    $holder.BackColor = Get-ManoUiColor 'Side'
+    $bar = New-Object System.Windows.Forms.Panel
+    $bar.Location = New-Object System.Drawing.Point(0, 8)
+    $bar.Size = New-Object System.Drawing.Size(3, 30)
+    $bar.BackColor = Get-ManoUiColor 'Accent'
+    $bar.Visible = $false
+    $button = New-Object System.Windows.Forms.Button
+    $button.Text = '   ' + $Text
+    $button.Location = New-Object System.Drawing.Point(3, 0)
+    $button.Size = New-Object System.Drawing.Size(233, 46)
+    $button.FlatStyle = 'Flat'
+    $button.FlatAppearance.BorderSize = 0
+    $button.TextAlign = 'MiddleLeft'
+    $button.TabStop = $false
+    $button.BackColor = Get-ManoUiColor 'Side'
+    $button.ForeColor = Get-ManoUiColor 'Muted'
+    $button.Font = New-Object System.Drawing.Font('Segoe UI', 10, [System.Drawing.FontStyle]::Regular)
+    $button.Cursor = 'Hand'
+    $button.Add_Click($OnClick)
+    $holder.Controls.Add($bar)
+    $holder.Controls.Add($button)
+    $Parent.Controls.Add($holder)
+    [pscustomobject]@{ Name = $Name; Button = $button; Bar = $bar; Holder = $holder }
+}
+
+function Show-ManoGui {
+    Ensure-ManoNative
+    $form = New-Object System.Windows.Forms.Form
+    $form.Text = "ManoSegura $($script:Version) - mano remota segura"
+    $form.Size = New-Object System.Drawing.Size(1180, 760)
+    $form.MinimumSize = New-Object System.Drawing.Size(1020, 680)
+    $monitor = Get-ManoTargetMonitor
+    $form.StartPosition = 'Manual'
+    $form.Location = New-Object System.Drawing.Point(($monitor.Bounds.X + [int](($monitor.Bounds.Width - 1180) / 2)), ($monitor.Bounds.Y + [int](($monitor.Bounds.Height - 760) / 2)))
+    $form.BackColor = Get-ManoUiColor 'Bg'
+    $form.ForeColor = Get-ManoUiColor 'Text'
+    $form.Font = New-Object System.Drawing.Font('Segoe UI', 9.5)
+
+    $g = @{
+        Form = $form; OverlayForms = $null; OverlayShown = $false; LastRefresh = (Get-Date)
+        Sections = @{}; NavItems = @(); ActiveSection = 'windows'
+        SectionTitles = @{ windows = 'Ventanas'; actions = 'Acciones'; settings = 'Ajustes'; log = 'Registro' }
+        SectionSubtitles = @{
+            windows  = 'Elige la ventana que puede controlar el asistente (una sola).'
+            actions  = 'Acciones puntuales sobre la ventana objetivo.'
+            settings = 'Opciones de ManoSegura; se guardan en config.json.'
+            log      = 'Historial de acciones y avisos.'
+        }
+    }
+    $script:Gui = $g
+
+    $root = New-Object System.Windows.Forms.TableLayoutPanel
+    $root.Dock = 'Fill'
+    $root.ColumnCount = 2
+    $root.RowCount = 2
+    $root.BackColor = Get-ManoUiColor 'Bg'
+    $root.ColumnStyles.Add((New-Object System.Windows.Forms.ColumnStyle([System.Windows.Forms.SizeType]::Absolute, 236))) | Out-Null
+    $root.ColumnStyles.Add((New-Object System.Windows.Forms.ColumnStyle([System.Windows.Forms.SizeType]::Percent, 100))) | Out-Null
+    $root.RowStyles.Add((New-Object System.Windows.Forms.RowStyle([System.Windows.Forms.SizeType]::Percent, 100))) | Out-Null
+    $root.RowStyles.Add((New-Object System.Windows.Forms.RowStyle([System.Windows.Forms.SizeType]::Absolute, 30))) | Out-Null
+    $form.Controls.Add($root)
+
+    # ---------------- barra lateral ----------------
+    $side = New-Object System.Windows.Forms.Panel
+    $side.Dock = 'Fill'
+    $side.Margin = New-Object System.Windows.Forms.Padding(0)
+    $side.BackColor = Get-ManoUiColor 'Side'
+    $root.Controls.Add($side, 0, 0)
+    $root.SetRowSpan($side, 2)
+
+    $logo = New-Object System.Windows.Forms.Panel
+    $logo.Location = New-Object System.Drawing.Point(22, 22)
+    $logo.Size = New-Object System.Drawing.Size(38, 38)
+    $logo.BackColor = Get-ManoUiColor 'Accent'
+    $side.Controls.Add($logo)
+    $logoText = New-Object System.Windows.Forms.Label
+    $logoText.Text = 'M'
+    $logoText.Dock = 'Fill'
+    $logoText.TextAlign = 'MiddleCenter'
+    $logoText.Font = New-Object System.Drawing.Font('Segoe UI', 16, [System.Drawing.FontStyle]::Bold)
+    $logoText.ForeColor = Get-ManoUiColor 'AccentText'
+    $logo.Controls.Add($logoText)
+    [void](New-ManoUiLabel -Parent $side -Text 'ManoSegura' -X 70 -Y 22 -W 150 -H 22 -Size 14 -Bold)
+    [void](New-ManoUiLabel -Parent $side -Text 'mano remota segura' -X 70 -Y 44 -W 150 -H 16 -Size 8.5 -Color 'Muted')
+
+    $navY = 96
+    foreach ($item in @(
+            @{ Name = 'windows'; Text = 'Ventanas' },
+            @{ Name = 'actions'; Text = 'Acciones' },
+            @{ Name = 'settings'; Text = 'Ajustes' },
+            @{ Name = 'log'; Text = 'Registro' }
+        )) {
+        $navName = $item.Name
+        $navButton = New-ManoNavItem -Parent $side -Name $navName -Text $item.Text -Y $navY
+        $g.NavItems += $navButton
+        $navY += 50
+    }
+
+    $bottom = New-Object System.Windows.Forms.Panel
+    $bottom.Dock = 'Bottom'
+    $bottom.Height = 240
+    $bottom.BackColor = Get-ManoUiColor 'Side'
+    $side.Controls.Add($bottom)
+    $line = New-Object System.Windows.Forms.Panel
+    $line.Dock = 'Top'
+    $line.Height = 1
+    $line.BackColor = Get-ManoUiColor 'Border'
+    $bottom.Controls.Add($line)
+    $g.SideState = New-ManoUiLabel -Parent $bottom -Text 'ACTIVA' -X 22 -Y 16 -W 150 -H 20 -Size 9 -Bold -Color 'Accent'
+    $g.SideTarget = New-ManoUiLabel -Parent $bottom -Text 'Ventana: (ninguna)' -X 22 -Y 44 -W 196 -H 18 -Size 8.5 -Color 'Muted'
+    $g.SideMonitor = New-ManoUiLabel -Parent $bottom -Text 'Monitor: ?' -X 22 -Y 64 -W 196 -H 18 -Size 8.5 -Color 'Muted'
+    $g.SideHotkey = New-ManoUiLabel -Parent $bottom -Text ('Panico: ' + $script:Cfg.PanicHotkey) -X 22 -Y 84 -W 196 -H 18 -Size 8.5 -Color 'Muted'
+    $g.Panic = New-ManoUiButton -Parent $bottom -Text 'PANICO' -X 22 -Y 112 -W 192 -H 50 -Kind danger
+    $g.Panic.Font = New-Object System.Drawing.Font('Segoe UI', 12, [System.Drawing.FontStyle]::Bold)
+    $g.Panic.Add_Click({
+            Invoke-ManoPanic | Out-Null
+            $script:Gui.LogBox.AppendText('PANICO: ManoSegura desactivada.' + [Environment]::NewLine)
+            Update-ManoGuiStatus
+        })
+    [void](New-ManoUiLabel -Parent $bottom -Text 'Atajo de panico global.' -X 22 -Y 170 -W 196 -H 16 -Size 8 -Color 'Muted')
+    [void](New-ManoUiLabel -Parent $bottom -Text "v$($script:Version)" -X 22 -Y 204 -W 100 -H 16 -Size 8 -Color 'Muted')
+
+    # ---------------- area principal ----------------
+    $main = New-Object System.Windows.Forms.Panel
+    $main.Dock = 'Fill'
+    $main.Margin = New-Object System.Windows.Forms.Padding(0)
+    $main.Padding = New-Object System.Windows.Forms.Padding(24, 14, 24, 10)
+    $main.BackColor = Get-ManoUiColor 'Bg'
+    $root.Controls.Add($main, 1, 0)
+
+    $mainTable = New-Object System.Windows.Forms.TableLayoutPanel
+    $mainTable.Dock = 'Fill'
+    $mainTable.Margin = New-Object System.Windows.Forms.Padding(0)
+    $mainTable.ColumnCount = 1
+    $mainTable.RowCount = 2
+    $mainTable.RowStyles.Add((New-Object System.Windows.Forms.RowStyle([System.Windows.Forms.SizeType]::Absolute, 74))) | Out-Null
+    $mainTable.RowStyles.Add((New-Object System.Windows.Forms.RowStyle([System.Windows.Forms.SizeType]::Percent, 100))) | Out-Null
+    $main.Controls.Add($mainTable)
+
+    $header = New-Object System.Windows.Forms.Panel
+    $header.Dock = 'Fill'
+    $header.Margin = New-Object System.Windows.Forms.Padding(0)
+    $header.BackColor = Get-ManoUiColor 'Bg'
+    $mainTable.Controls.Add($header, 0, 0)
+
+    $headTable = New-Object System.Windows.Forms.TableLayoutPanel
+    $headTable.Dock = 'Fill'
+    $headTable.Margin = New-Object System.Windows.Forms.Padding(0)
+    $headTable.ColumnCount = 2
+    $headTable.RowCount = 1
+    $headTable.ColumnStyles.Add((New-Object System.Windows.Forms.ColumnStyle([System.Windows.Forms.SizeType]::Percent, 100))) | Out-Null
+    $headTable.ColumnStyles.Add((New-Object System.Windows.Forms.ColumnStyle([System.Windows.Forms.SizeType]::Absolute, 330))) | Out-Null
+    $header.Controls.Add($headTable)
+
+    $headLeft = New-Object System.Windows.Forms.Panel
+    $headLeft.Dock = 'Fill'
+    $headLeft.Margin = New-Object System.Windows.Forms.Padding(0)
+    $headLeft.BackColor = Get-ManoUiColor 'Bg'
+    $headTable.Controls.Add($headLeft, 0, 0)
+    $g.HeaderTitle = New-ManoUiLabel -Parent $headLeft -Text 'Ventanas' -X 0 -Y 2 -W 520 -H 32 -Size 18 -Bold
+    $g.HeaderSub = New-ManoUiLabel -Parent $headLeft -Text '' -X 0 -Y 40 -W 560 -H 20 -Size 9 -Color 'Muted'
+
+    $headRight = New-Object System.Windows.Forms.Panel
+    $headRight.Dock = 'Fill'
+    $headRight.Margin = New-Object System.Windows.Forms.Padding(0)
+    $headRight.BackColor = Get-ManoUiColor 'Bg'
+    $headTable.Controls.Add($headRight, 1, 0)
+    $g.TopTrust = New-ManoUiButton -Parent $headRight -Text 'Confiar 10 min' -X 0 -Y 10 -W 150 -H 38 -Kind subtle
+    $g.TopTrust.Add_Click({
+            if (Test-ManoTrustActive) { Clear-ManoTrust } else { [void](Set-ManoTrustMinutes 10) }
+            Update-ManoGuiStatus
+        })
+    $g.TopActivate = New-ManoUiButton -Parent $headRight -Text 'Activar' -X 160 -Y 10 -W 100 -H 38 -Kind primary
+    $g.TopActivate.Add_Click({
+            Set-ManoDisabled -Disabled $false
+            Update-ManoGuiStatus
+        })
+
+    $hostPanel = New-Object System.Windows.Forms.Panel
+    $hostPanel.Dock = 'Fill'
+    $hostPanel.Margin = New-Object System.Windows.Forms.Padding(0)
+    $hostPanel.BackColor = Get-ManoUiColor 'Bg'
+    $mainTable.Controls.Add($hostPanel, 0, 1)
+
+    # ---------------- seccion Ventanas ----------------
+    $windowsPanel = New-Object System.Windows.Forms.Panel
+    $windowsPanel.Dock = 'Fill'
+    $windowsPanel.BackColor = Get-ManoUiColor 'Bg'
+    $hostPanel.Controls.Add($windowsPanel)
+    $g.Sections['windows'] = $windowsPanel
+
+    $winTable = New-Object System.Windows.Forms.TableLayoutPanel
+    $winTable.Dock = 'Fill'
+    $winTable.ColumnCount = 1
+    $winTable.RowCount = 3
+    $winTable.RowStyles.Add((New-Object System.Windows.Forms.RowStyle([System.Windows.Forms.SizeType]::Absolute, 44))) | Out-Null
+    $winTable.RowStyles.Add((New-Object System.Windows.Forms.RowStyle([System.Windows.Forms.SizeType]::Percent, 100))) | Out-Null
+    $winTable.RowStyles.Add((New-Object System.Windows.Forms.RowStyle([System.Windows.Forms.SizeType]::Absolute, 56))) | Out-Null
+    $windowsPanel.Controls.Add($winTable)
+
+    $toolbar = New-Object System.Windows.Forms.Panel
+    $toolbar.Dock = 'Fill'
+    $toolbar.Margin = New-Object System.Windows.Forms.Padding(0)
+    $toolbar.BackColor = Get-ManoUiColor 'Bg'
+    $winTable.Controls.Add($toolbar, 0, 0)
+    $g.FilterBox = New-Object System.Windows.Forms.TextBox
+    $g.FilterBox.Location = New-Object System.Drawing.Point(0, 6)
+    $g.FilterBox.Size = New-Object System.Drawing.Size(300, 28)
+    $g.FilterBox.BackColor = Get-ManoUiColor 'Card'
+    $g.FilterBox.ForeColor = Get-ManoUiColor 'Text'
+    $g.FilterBox.BorderStyle = 'FixedSingle'
+    $g.FilterBox.Font = New-Object System.Drawing.Font('Segoe UI', 10)
+    $g.FilterBox.Add_TextChanged({ Update-ManoGuiWindowList })
+    $toolbar.Controls.Add($g.FilterBox)
+    $placeholder = New-ManoUiLabel -Parent $toolbar -Text 'Filtrar por titulo o proceso...' -X 10 -Y 10 -W 260 -H 18 -Size 9 -Color 'Muted'
+    $placeholder.BackColor = Get-ManoUiColor 'Card'
+    $placeholder.BringToFront()
+    $g.FilterPlaceholder = $placeholder
+    $placeholder.Add_Click({ $script:Gui.FilterBox.Focus(); $script:Gui.FilterPlaceholder.Visible = $false })
+    $g.FilterBox.Add_GotFocus({ $script:Gui.FilterPlaceholder.Visible = $false })
+    $g.FilterBox.Add_LostFocus({ if (-not $script:Gui.FilterBox.Text) { $script:Gui.FilterPlaceholder.Visible = $true } })
+    $refresh = New-ManoUiButton -Parent $toolbar -Text 'Refrescar' -X 312 -Y 4 -W 96 -H 32 -Kind subtle
+    $refresh.Add_Click({ Update-ManoGuiWindowList })
+    $g.AutoRefresh = New-Object System.Windows.Forms.CheckBox
+    $g.AutoRefresh.Text = 'Auto 5 s'
+    $g.AutoRefresh.Location = New-Object System.Drawing.Point(420, 10)
+    $g.AutoRefresh.Size = New-Object System.Drawing.Size(90, 22)
+    $g.AutoRefresh.ForeColor = Get-ManoUiColor 'Muted'
+    $g.AutoRefresh.BackColor = Get-ManoUiColor 'Bg'
+    $g.AutoRefresh.Checked = $true
+    $toolbar.Controls.Add($g.AutoRefresh)
+    $g.CountLabel = New-ManoUiLabel -Parent $toolbar -Text '' -X 520 -Y 12 -W 120 -H 18 -Size 8.5 -Color 'Muted'
+
+    $grid = New-Object System.Windows.Forms.DataGridView
+    $grid.Dock = 'Fill'
+    $grid.Margin = New-Object System.Windows.Forms.Padding(0)
+    $grid.BackgroundColor = Get-ManoUiColor 'Card'
+    $grid.BorderStyle = 'None'
+    $grid.GridColor = Get-ManoUiColor 'Border'
+    $grid.RowHeadersVisible = $false
+    $grid.AllowUserToAddRows = $false
+    $grid.AllowUserToDeleteRows = $false
+    $grid.AllowUserToResizeRows = $false
+    $grid.ReadOnly = $true
+    $grid.MultiSelect = $false
+    $grid.SelectionMode = 'FullRowSelect'
+    $grid.AutoSizeColumnsMode = 'Fill'
+    $grid.ColumnHeadersHeight = 34
+    $grid.RowTemplate.Height = 30
+    $grid.EnableHeadersVisualStyles = $false
+    $grid.ColumnHeadersDefaultCellStyle.BackColor = Get-ManoUiColor 'CardAlt'
+    $grid.ColumnHeadersDefaultCellStyle.ForeColor = Get-ManoUiColor 'Muted'
+    $grid.ColumnHeadersDefaultCellStyle.Font = New-Object System.Drawing.Font('Segoe UI', 9, [System.Drawing.FontStyle]::Bold)
+    $grid.ColumnHeadersDefaultCellStyle.SelectionBackColor = Get-ManoUiColor 'CardAlt'
+    $grid.DefaultCellStyle.BackColor = Get-ManoUiColor 'Card'
+    $grid.DefaultCellStyle.ForeColor = Get-ManoUiColor 'Text'
+    $grid.DefaultCellStyle.SelectionBackColor = [System.Drawing.Color]::FromArgb(31, 43, 56)
+    $grid.DefaultCellStyle.SelectionForeColor = [System.Drawing.Color]::White
+    $grid.DefaultCellStyle.Font = New-Object System.Drawing.Font('Segoe UI', 9.5)
+    $grid.Columns.Add('hwnd', 'HWND') | Out-Null
+    $grid.Columns.Add('process', 'Proceso') | Out-Null
+    $grid.Columns.Add('title', 'Titulo') | Out-Null
+    $grid.Columns.Add('monitor', 'Monitor') | Out-Null
+    $grid.Columns.Add('blocked', 'Bloq.') | Out-Null
+    $grid.Columns['hwnd'].FillWeight = 12
+    $grid.Columns['process'].FillWeight = 18
+    $grid.Columns['title'].FillWeight = 46
+    $grid.Columns['monitor'].FillWeight = 16
+    $grid.Columns['blocked'].FillWeight = 8
+    foreach ($name in @('hwnd', 'process', 'title', 'monitor', 'blocked')) { $grid.Columns[$name].SortMode = 'NotSortable' }
+    $grid.Add_CellDoubleClick({ Use-ManoSelectedWindow })
+    $winTable.Controls.Add($grid, 0, 1)
+    $g.WindowGrid = $grid
+
+    $windowsFooter = New-Object System.Windows.Forms.Panel
+    $windowsFooter.Dock = 'Fill'
+    $windowsFooter.Margin = New-Object System.Windows.Forms.Padding(0)
+    $windowsFooter.BackColor = Get-ManoUiColor 'Bg'
+    $winTable.Controls.Add($windowsFooter, 0, 2)
+    $useButton = New-ManoUiButton -Parent $windowsFooter -Text 'Usar como objetivo' -X 0 -Y 12 -W 170 -H 36 -Kind primary
+    $useButton.Add_Click({ Use-ManoSelectedWindow })
+    $captureButton = New-ManoUiButton -Parent $windowsFooter -Text 'Capturar ventana' -X 180 -Y 12 -W 150 -H 36 -Kind subtle
+    $captureButton.Add_Click({ Invoke-ManoGuiAction -Script { Invoke-ManoScreenshot -Mode window } })
+    [void](New-ManoUiLabel -Parent $windowsFooter -Text 'Doble clic en una fila para elegirla.' -X 350 -Y 20 -W 300 -H 18 -Size 8.5 -Color 'Muted')
+
+    # ---------------- seccion Acciones ----------------
+    $actionsPanel = New-Object System.Windows.Forms.Panel
+    $actionsPanel.Dock = 'Fill'
+    $actionsPanel.BackColor = Get-ManoUiColor 'Bg'
+    $actionsPanel.AutoScroll = $true
+    $hostPanel.Controls.Add($actionsPanel)
+    $actionsPanel.Visible = $false
+    $g.Sections['actions'] = $actionsPanel
+    Add-ManoGuiActionPanel -Parent $actionsPanel
+
+    # ---------------- seccion Ajustes ----------------
+    $settingsPanel = New-Object System.Windows.Forms.Panel
+    $settingsPanel.Dock = 'Fill'
+    $settingsPanel.BackColor = Get-ManoUiColor 'Bg'
+    $settingsPanel.AutoScroll = $true
+    $hostPanel.Controls.Add($settingsPanel)
+    $settingsPanel.Visible = $false
+    $g.Sections['settings'] = $settingsPanel
+    Add-ManoGuiSettingsPanel -Parent $settingsPanel
+
+    # ---------------- seccion Registro ----------------
+    $logPanel = New-Object System.Windows.Forms.Panel
+    $logPanel.Dock = 'Fill'
+    $logPanel.BackColor = Get-ManoUiColor 'Bg'
+    $hostPanel.Controls.Add($logPanel)
+    $logPanel.Visible = $false
+    $g.Sections['log'] = $logPanel
+    $logTable = New-Object System.Windows.Forms.TableLayoutPanel
+    $logTable.Dock = 'Fill'
+    $logTable.ColumnCount = 1
+    $logTable.RowCount = 2
+    $logTable.RowStyles.Add((New-Object System.Windows.Forms.RowStyle([System.Windows.Forms.SizeType]::Percent, 100))) | Out-Null
+    $logTable.RowStyles.Add((New-Object System.Windows.Forms.RowStyle([System.Windows.Forms.SizeType]::Absolute, 50))) | Out-Null
+    $logPanel.Controls.Add($logTable)
+    $g.LogBox = New-Object System.Windows.Forms.TextBox
+    $g.LogBox.Multiline = $true
+    $g.LogBox.ReadOnly = $true
+    $g.LogBox.ScrollBars = 'Vertical'
+    $g.LogBox.Dock = 'Fill'
+    $g.LogBox.Margin = New-Object System.Windows.Forms.Padding(0)
+    $g.LogBox.BackColor = [System.Drawing.Color]::FromArgb(6, 9, 12)
+    $g.LogBox.ForeColor = [System.Drawing.Color]::FromArgb(198, 214, 229)
+    $g.LogBox.BorderStyle = 'None'
+    $g.LogBox.Font = New-Object System.Drawing.Font('Consolas', 9.5)
+    $g.LogBox.WordWrap = $true
+    $logTable.Controls.Add($g.LogBox, 0, 0)
+    $logFooter = New-Object System.Windows.Forms.Panel
+    $logFooter.Dock = 'Fill'
+    $logFooter.Margin = New-Object System.Windows.Forms.Padding(0)
+    $logFooter.BackColor = Get-ManoUiColor 'Bg'
+    $logTable.Controls.Add($logFooter, 0, 1)
+    $logRefresh = New-ManoUiButton -Parent $logFooter -Text 'Actualizar' -X 0 -Y 8 -W 110 -H 34 -Kind subtle
+    $logRefresh.Add_Click({ Show-ManoGuiLog })
+    $logOpen = New-ManoUiButton -Parent $logFooter -Text 'Abrir carpeta' -X 120 -Y 8 -W 130 -H 34 -Kind subtle
+    $logOpen.Add_Click({ Start-Process -FilePath 'explorer.exe' -ArgumentList "`"$($script:LogsDir)`"" })
+
+    # ---------------- barra inferior ----------------
+    $statusBar = New-Object System.Windows.Forms.Panel
+    $statusBar.Dock = 'Fill'
+    $statusBar.Margin = New-Object System.Windows.Forms.Padding(0)
+    $statusBar.BackColor = Get-ManoUiColor 'Side'
+    $root.Controls.Add($statusBar, 1, 1)
+    $g.StatusLabel = New-ManoUiLabel -Parent $statusBar -Text 'Listo.' -X 12 -Y 6 -W 900 -H 18 -Size 8.5 -Color 'Muted'
+    $hintLabel = New-ManoUiLabel -Parent $statusBar -Text 'CLI: ManoSegura.ps1 help' -X 950 -Y 6 -W 220 -H 18 -Size 8.5 -Color 'Muted'
+    $hintLabel.Anchor = 'Top,Right'
+
+    $form.Add_Shown({
+            try { $dark = 1; [void][ManoNative.Win]::DwmSetWindowAttribute($form.Handle, 20, [ref]$dark, 4) } catch { }
+            $initialSection = if ($env:MANOSEGURA_GUI_SECTION) { $env:MANOSEGURA_GUI_SECTION } else { 'windows' }
+            Show-ManoSection $initialSection
+            Update-ManoGuiStatus
+            Update-ManoGuiWindowList
+            Show-ManoGuiLog
+            Register-ManoGuiHotkey
+        })
+    $form.Add_FormClosing({
+            try { [void][ManoNative.Win]::UnregisterHotKey($script:Gui.Form.Handle, 1) } catch { }
+            Hide-ManoOverlay
+        })
+
+    $g.Timer = New-Object System.Windows.Forms.Timer
+    $g.Timer.Interval = 500
+    $g.Timer.Add_Tick({
+            Update-ManoGuiStatus
+            Update-ManoOverlay
+            if ($script:Gui.AutoRefresh.Checked -and ((Get-Date) - $script:Gui.LastRefresh).TotalSeconds -ge 5) { Update-ManoGuiWindowList }
+        })
+    $g.Timer.Start()
+    try {
+        [void]$form.ShowDialog()
+    } finally {
+        $g.Timer.Stop()
+        Hide-ManoOverlay
+        if ($g.OverlayForms) { foreach ($f in $g.OverlayForms) { $f.Dispose() } }
+        $form.Dispose()
+        $script:Gui = $null
+    }
+}
+
+
+function Use-ManoSelectedWindow {
+    if (-not $script:Gui -or -not $script:Gui.WindowGrid) { return }
+    if ($script:Gui.WindowGrid.SelectedRows.Count -eq 0) { return }
+    $row = $script:Gui.WindowGrid.SelectedRows[0]
+    $hwndValue = [int64]$row.Tag
+    Invoke-ManoGuiAction -Script {
+        param($value)
+        $hwnd = [IntPtr]$value
+        if (-not [ManoNative.Win]::IsWindow($hwnd)) { Throw-ManoError 'Esa ventana ya no existe.' 1 }
+        [void](Assert-ManoWindowAllowed $hwnd)
+        [void](Assert-ManoWindowOnMonitor $hwnd)
+        Set-ManoTarget $hwnd
+        [void](Focus-ManoWindow $hwnd)
+        "Objetivo: $value  $(Get-ManoWindowTitle $hwnd)"
+    } -Arguments @($hwndValue)
+}
+
+function Add-ManoGuiActionPanel {
+    param($Parent)
+
+    $action = @{}
+    $script:Gui.Action = $action
+
+    $cards = @(
+        @{ Title = 'Clic en la ventana'; X = 0; Y = 0; W = 400; H = 170 },
+        @{ Title = 'Escribir o pegar'; X = 420; Y = 0; W = 400; H = 170 },
+        @{ Title = 'Teclas'; X = 0; Y = 190; W = 400; H = 150 },
+        @{ Title = 'Scroll y arrastre'; X = 420; Y = 190; W = 400; H = 190 },
+        @{ Title = 'Esperar y batch'; X = 0; Y = 360; W = 400; H = 190 }
+    )
+    foreach ($info in $cards) {
+        $info.Card = New-ManoUiCard -Parent $Parent -Title $info.Title -X $info.X -Y $info.Y -W $info.W -H $info.H
+    }
+
+    $clickCard = $cards[0].Card
+    [void](New-ManoUiLabel -Parent $clickCard -Text 'X' -X 16 -Y 46 -W 18 -H 20 -Size 9 -Color 'Muted')
+    $action.X = New-Object System.Windows.Forms.NumericUpDown
+    $action.X.Location = New-Object System.Drawing.Point(38, 44)
+    $action.X.Size = New-Object System.Drawing.Size(80, 26)
+    $action.X.Maximum = 10000
+    $action.X.BackColor = Get-ManoUiColor 'CardAlt'
+    $action.X.ForeColor = Get-ManoUiColor 'Text'
+    $action.X.BorderStyle = 'FixedSingle'
+    $clickCard.Controls.Add($action.X)
+    [void](New-ManoUiLabel -Parent $clickCard -Text 'Y' -X 130 -Y 46 -W 18 -H 20 -Size 9 -Color 'Muted')
+    $action.Y = New-Object System.Windows.Forms.NumericUpDown
+    $action.Y.Location = New-Object System.Drawing.Point(152, 44)
+    $action.Y.Size = New-Object System.Drawing.Size(80, 26)
+    $action.Y.Maximum = 10000
+    $action.Y.BackColor = Get-ManoUiColor 'CardAlt'
+    $action.Y.ForeColor = Get-ManoUiColor 'Text'
+    $action.Y.BorderStyle = 'FixedSingle'
+    $clickCard.Controls.Add($action.Y)
+    $action.Button = New-Object System.Windows.Forms.ComboBox
+    $action.Button.Location = New-Object System.Drawing.Point(244, 44)
+    $action.Button.Size = New-Object System.Drawing.Size(90, 26)
+    $action.Button.DropDownStyle = 'DropDownList'
+    $action.Button.BackColor = Get-ManoUiColor 'CardAlt'
+    $action.Button.ForeColor = Get-ManoUiColor 'Text'
+    [void]$action.Button.Items.AddRange(@('left', 'right', 'double'))
+    $action.Button.SelectedIndex = 0
+    $clickCard.Controls.Add($action.Button)
+    $clickButton = New-ManoUiButton -Parent $clickCard -Text 'Hacer clic' -X 16 -Y 88 -W 120 -H 34 -Kind primary
+    $clickButton.Add_Click({
+            $x = [int]$script:Gui.Action.X.Value
+            $y = [int]$script:Gui.Action.Y.Value
+            $button = [string]$script:Gui.Action.Button.SelectedItem
+            Invoke-ManoGuiAction -Script { param($px, $py, $pb) Invoke-ManoClick -X $px -Y $py -Button $pb } -Arguments @($x, $y, $button)
+        })
+    [void](New-ManoUiLabel -Parent $clickCard -Text 'Coordenadas relativas a la ventana.' -X 16 -Y 132 -W 300 -H 18 -Size 8.5 -Color 'Muted')
+
+    $typeCard = $cards[1].Card
+    $action.TypeText = New-Object System.Windows.Forms.TextBox
+    $action.TypeText.Location = New-Object System.Drawing.Point(16, 46)
+    $action.TypeText.Size = New-Object System.Drawing.Size(300, 28)
+    $action.TypeText.BackColor = Get-ManoUiColor 'CardAlt'
+    $action.TypeText.ForeColor = Get-ManoUiColor 'Text'
+    $action.TypeText.BorderStyle = 'FixedSingle'
+    $typeCard.Controls.Add($action.TypeText)
+    $typeButton = New-ManoUiButton -Parent $typeCard -Text 'Escribir' -X 16 -Y 88 -W 100 -H 34 -Kind primary
+    $typeButton.Add_Click({
+            $text = [string]$script:Gui.Action.TypeText.Text
+            Invoke-ManoGuiAction -Script { param($value) Invoke-ManoTypeText $value } -Arguments @($text)
+        })
+    $pasteButton = New-ManoUiButton -Parent $typeCard -Text 'Pegar' -X 126 -Y 88 -W 100 -H 34 -Kind subtle
+    $pasteButton.Add_Click({
+            $text = [string]$script:Gui.Action.TypeText.Text
+            Invoke-ManoGuiAction -Script { param($value) Invoke-ManoPasteText $value } -Arguments @($text)
+        })
+    [void](New-ManoUiLabel -Parent $typeCard -Text 'Nunca escribe en campos de contrasena.' -X 16 -Y 132 -W 300 -H 18 -Size 8.5 -Color 'Muted')
+
+    $keyCard = $cards[2].Card
+    $action.Key = New-Object System.Windows.Forms.TextBox
+    $action.Key.Text = 'ctrl+s'
+    $action.Key.Location = New-Object System.Drawing.Point(16, 46)
+    $action.Key.Size = New-Object System.Drawing.Size(160, 28)
+    $action.Key.BackColor = Get-ManoUiColor 'CardAlt'
+    $action.Key.ForeColor = Get-ManoUiColor 'Text'
+    $action.Key.BorderStyle = 'FixedSingle'
+    $keyCard.Controls.Add($action.Key)
+    $keyButton = New-ManoUiButton -Parent $keyCard -Text 'Pulsar' -X 186 -Y 44 -W 100 -H 34 -Kind primary
+    $keyButton.Add_Click({
+            $combo = [string]$script:Gui.Action.Key.Text
+            Invoke-ManoGuiAction -Script { param($value) Invoke-ManoKeyCombo $value } -Arguments @($combo)
+        })
+    [void](New-ManoUiLabel -Parent $keyCard -Text 'Ejemplos: enter, tab, esc, ctrl+s, alt+f1' -X 16 -Y 88 -W 340 -H 18 -Size 8.5 -Color 'Muted')
+
+    $scrollCard = $cards[3].Card
+    $action.Scroll = New-Object System.Windows.Forms.NumericUpDown
+    $action.Scroll.Location = New-Object System.Drawing.Point(16, 44)
+    $action.Scroll.Size = New-Object System.Drawing.Size(70, 26)
+    $action.Scroll.Minimum = -20
+    $action.Scroll.Maximum = 20
+    $action.Scroll.Value = -3
+    $action.Scroll.BackColor = Get-ManoUiColor 'CardAlt'
+    $action.Scroll.ForeColor = Get-ManoUiColor 'Text'
+    $action.Scroll.BorderStyle = 'FixedSingle'
+    $scrollCard.Controls.Add($action.Scroll)
+    $scrollButton = New-ManoUiButton -Parent $scrollCard -Text 'Scroll' -X 96 -Y 42 -W 90 -H 32 -Kind subtle
+    $scrollButton.Add_Click({
+            $steps = [int]$script:Gui.Action.Scroll.Value
+            Invoke-ManoGuiAction -Script { param($value) Invoke-ManoScroll -Steps $value } -Arguments @($steps)
+        })
+    [void](New-ManoUiLabel -Parent $scrollCard -Text 'Arrastrar: x1, y1 -> x2, y2' -X 16 -Y 82 -W 220 -H 18 -Size 8.5 -Color 'Muted')
+    $action.Drag = @()
+    for ($i = 0; $i -lt 4; $i++) {
+        $num = New-Object System.Windows.Forms.NumericUpDown
+        $num.Location = New-Object System.Drawing.Point((16 + $i * 62), 106)
+        $num.Size = New-Object System.Drawing.Size(56, 26)
+        $num.Maximum = 10000
+        $num.BackColor = Get-ManoUiColor 'CardAlt'
+        $num.ForeColor = Get-ManoUiColor 'Text'
+        $num.BorderStyle = 'FixedSingle'
+        $scrollCard.Controls.Add($num)
+        $action.Drag += $num
+    }
+    $dragButton = New-ManoUiButton -Parent $scrollCard -Text 'Arrastrar' -X 268 -Y 104 -W 100 -H 30 -Kind primary
+    $dragButton.Add_Click({
+            $points = @(
+                [int]$script:Gui.Action.Drag[0].Value, [int]$script:Gui.Action.Drag[1].Value,
+                [int]$script:Gui.Action.Drag[2].Value, [int]$script:Gui.Action.Drag[3].Value
+            )
+            Invoke-ManoGuiAction -Script {
+                param($x1, $y1, $x2, $y2)
+                Invoke-ManoDrag -FromX $x1 -FromY $y1 -ToX $x2 -ToY $y2
+            } -Arguments $points
+        })
+
+    $waitCard = $cards[4].Card
+    $action.Wait = New-Object System.Windows.Forms.NumericUpDown
+    $action.Wait.Location = New-Object System.Drawing.Point(16, 46)
+    $action.Wait.Size = New-Object System.Drawing.Size(90, 26)
+    $action.Wait.Minimum = 0
+    $action.Wait.Maximum = 10000
+    $action.Wait.Increment = 100
+    $action.Wait.Value = 500
+    $action.Wait.BackColor = Get-ManoUiColor 'CardAlt'
+    $action.Wait.ForeColor = Get-ManoUiColor 'Text'
+    $action.Wait.BorderStyle = 'FixedSingle'
+    $waitCard.Controls.Add($action.Wait)
+    $waitButton = New-ManoUiButton -Parent $waitCard -Text 'Esperar ms' -X 116 -Y 44 -W 110 -H 32 -Kind subtle
+    $waitButton.Add_Click({
+            $ms = [int]$script:Gui.Action.Wait.Value
+            Invoke-ManoGuiAction -Script { param($value) Invoke-ManoAction -Action wait -ActionArgs @([string]$value) } -Arguments @($ms)
+        })
+    $batchButton = New-ManoUiButton -Parent $waitCard -Text 'Ejecutar batch (.json)...' -X 16 -Y 90 -W 220 -H 34 -Kind primary
+    $batchButton.Add_Click({
+            $dialog = New-Object System.Windows.Forms.OpenFileDialog
+            $dialog.Filter = 'JSON (*.json)|*.json|Todos (*.*)|*.*'
+            if ($dialog.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) {
+                $path = $dialog.FileName
+                Invoke-ManoGuiAction -Script { param($value) Invoke-ManoBatchFile $value } -Arguments @($path)
+            }
+        })
+    [void](New-ManoUiLabel -Parent $waitCard -Text 'Valida todos los pasos antes de pedir permiso.' -X 16 -Y 134 -W 340 -H 18 -Size 8.5 -Color 'Muted')
+}
+
+function Add-ManoGuiSettingsPanel {
+    param($Parent)
+
+    $settings = @{}
+    $script:Gui.Settings = $settings
+
+    $general = New-ManoUiCard -Parent $Parent -Title 'General' -X 0 -Y 0 -W 520 -H 250
+    $rows1 = @(
+        @{ Label = 'Monitor objetivo'; Key = 'Target'; Control = 'text' },
+        @{ Label = 'Confirmacion (ask/auto)'; Key = 'Mode'; Control = 'mode' },
+        @{ Label = 'Timeout de confirmacion (s)'; Key = 'Timeout'; Control = 'timeout' },
+        @{ Label = 'Confianza maxima (min)'; Key = 'Trust'; Control = 'trust' }
+    )
+    $y = 44
+    foreach ($row in $rows1) {
+        [void](New-ManoUiLabel -Parent $general -Text $row.Label -X 16 -Y ($y + 4) -W 220 -H 20 -Size 9 -Color 'Muted')
+        if ($row.Control -eq 'text') {
+            $settings.Target = New-Object System.Windows.Forms.TextBox
+            $settings.Target.Text = [string]$script:Cfg.TargetMonitor
+            $settings.Target.Location = New-Object System.Drawing.Point(250, $y)
+            $settings.Target.Size = New-Object System.Drawing.Size(250, 26)
+            $settings.Target.BackColor = Get-ManoUiColor 'CardAlt'
+            $settings.Target.ForeColor = Get-ManoUiColor 'Text'
+            $settings.Target.BorderStyle = 'FixedSingle'
+            $general.Controls.Add($settings.Target)
+        } elseif ($row.Control -eq 'mode') {
+            $settings.Mode = New-Object System.Windows.Forms.ComboBox
+            $settings.Mode.Location = New-Object System.Drawing.Point(250, $y)
+            $settings.Mode.Size = New-Object System.Drawing.Size(120, 26)
+            $settings.Mode.DropDownStyle = 'DropDownList'
+            $settings.Mode.BackColor = Get-ManoUiColor 'CardAlt'
+            $settings.Mode.ForeColor = Get-ManoUiColor 'Text'
+            [void]$settings.Mode.Items.AddRange(@('ask', 'auto'))
+            $settings.Mode.SelectedItem = [string]$script:Cfg.ConfirmMode
+            $general.Controls.Add($settings.Mode)
+        } elseif ($row.Control -eq 'timeout') {
+            $settings.Timeout = New-Object System.Windows.Forms.NumericUpDown
+            $settings.Timeout.Location = New-Object System.Drawing.Point(250, $y)
+            $settings.Timeout.Size = New-Object System.Drawing.Size(90, 26)
+            $settings.Timeout.Minimum = 5
+            $settings.Timeout.Maximum = 300
+            $settings.Timeout.Value = [int]$script:Cfg.ConfirmTimeoutSec
+            $settings.Timeout.BackColor = Get-ManoUiColor 'CardAlt'
+            $settings.Timeout.ForeColor = Get-ManoUiColor 'Text'
+            $settings.Timeout.BorderStyle = 'FixedSingle'
+            $general.Controls.Add($settings.Timeout)
+        } elseif ($row.Control -eq 'trust') {
+            $settings.Trust = New-Object System.Windows.Forms.NumericUpDown
+            $settings.Trust.Location = New-Object System.Drawing.Point(250, $y)
+            $settings.Trust.Size = New-Object System.Drawing.Size(90, 26)
+            $settings.Trust.Minimum = 1
+            $settings.Trust.Maximum = 1440
+            $settings.Trust.Value = [int]$script:Cfg.TrustMaxMinutes
+            $settings.Trust.BackColor = Get-ManoUiColor 'CardAlt'
+            $settings.Trust.ForeColor = Get-ManoUiColor 'Text'
+            $settings.Trust.BorderStyle = 'FixedSingle'
+            $general.Controls.Add($settings.Trust)
+        }
+        $y += 44
+    }
+
+    $captures = New-ManoUiCard -Parent $Parent -Title 'Capturas' -X 540 -Y 0 -W 520 -H 250
+    $rows2 = @(
+        @{ Label = 'Carpeta (vacio = ./shots)'; Key = 'Shots'; Control = 'text' },
+        @{ Label = 'Formato'; Key = 'Format'; Control = 'format' },
+        @{ Label = 'Retardo del clic (ms)'; Key = 'ClickDelay'; Control = 'delay' },
+        @{ Label = 'Maximo de pasos por batch'; Key = 'Batch'; Control = 'batch' }
+    )
+    $y = 44
+    foreach ($row in $rows2) {
+        [void](New-ManoUiLabel -Parent $captures -Text $row.Label -X 16 -Y ($y + 4) -W 220 -H 20 -Size 9 -Color 'Muted')
+        if ($row.Control -eq 'text') {
+            $settings.Shots = New-Object System.Windows.Forms.TextBox
+            $settings.Shots.Text = [string]$script:Cfg.ShotsDir
+            $settings.Shots.Location = New-Object System.Drawing.Point(250, $y)
+            $settings.Shots.Size = New-Object System.Drawing.Size(230, 26)
+            $settings.Shots.BackColor = Get-ManoUiColor 'CardAlt'
+            $settings.Shots.ForeColor = Get-ManoUiColor 'Text'
+            $settings.Shots.BorderStyle = 'FixedSingle'
+            $captures.Controls.Add($settings.Shots)
+        } elseif ($row.Control -eq 'format') {
+            $settings.Format = New-Object System.Windows.Forms.ComboBox
+            $settings.Format.Location = New-Object System.Drawing.Point(250, $y)
+            $settings.Format.Size = New-Object System.Drawing.Size(100, 26)
+            $settings.Format.DropDownStyle = 'DropDownList'
+            $settings.Format.BackColor = Get-ManoUiColor 'CardAlt'
+            $settings.Format.ForeColor = Get-ManoUiColor 'Text'
+            [void]$settings.Format.Items.AddRange(@('png', 'jpg'))
+            $settings.Format.SelectedItem = [string]$script:Cfg.ShotFormat
+            $captures.Controls.Add($settings.Format)
+        } elseif ($row.Control -eq 'delay') {
+            $settings.ClickDelay = New-Object System.Windows.Forms.NumericUpDown
+            $settings.ClickDelay.Location = New-Object System.Drawing.Point(250, $y)
+            $settings.ClickDelay.Size = New-Object System.Drawing.Size(90, 26)
+            $settings.ClickDelay.Minimum = 0
+            $settings.ClickDelay.Maximum = 1000
+            $settings.ClickDelay.Increment = 10
+            $settings.ClickDelay.Value = [int]$script:Cfg.ClickDelayMs
+            $settings.ClickDelay.BackColor = Get-ManoUiColor 'CardAlt'
+            $settings.ClickDelay.ForeColor = Get-ManoUiColor 'Text'
+            $settings.ClickDelay.BorderStyle = 'FixedSingle'
+            $captures.Controls.Add($settings.ClickDelay)
+        } elseif ($row.Control -eq 'batch') {
+            $settings.Batch = New-Object System.Windows.Forms.NumericUpDown
+            $settings.Batch.Location = New-Object System.Drawing.Point(250, $y)
+            $settings.Batch.Size = New-Object System.Drawing.Size(90, 26)
+            $settings.Batch.Minimum = 1
+            $settings.Batch.Maximum = 200
+            $settings.Batch.Value = [int]$script:Cfg.MaxBatchSteps
+            $settings.Batch.BackColor = Get-ManoUiColor 'CardAlt'
+            $settings.Batch.ForeColor = Get-ManoUiColor 'Text'
+            $settings.Batch.BorderStyle = 'FixedSingle'
+            $captures.Controls.Add($settings.Batch)
+        }
+        $y += 44
+    }
+
+    $security = New-ManoUiCard -Parent $Parent -Title 'Seguridad' -X 0 -Y 270 -W 520 -H 250
+    $settings.Overlay = New-Object System.Windows.Forms.CheckBox
+    $settings.Overlay.Text = 'Mostrar borde en la ventana objetivo'
+    $settings.Overlay.Checked = [bool]$script:Cfg.Overlay
+    $settings.Overlay.Location = New-Object System.Drawing.Point(16, 44)
+    $settings.Overlay.Size = New-Object System.Drawing.Size(400, 24)
+    $settings.Overlay.ForeColor = Get-ManoUiColor 'Text'
+    $settings.Overlay.BackColor = Get-ManoUiColor 'Card'
+    $security.Controls.Add($settings.Overlay)
+    $settings.Sensitive = New-Object System.Windows.Forms.CheckBox
+    $settings.Sensitive.Text = 'Bloquear ventanas sensibles (login, pagos, correo)'
+    $settings.Sensitive.Checked = [bool]$script:Cfg.BlockSensitiveWindows
+    $settings.Sensitive.Location = New-Object System.Drawing.Point(16, 74)
+    $settings.Sensitive.Size = New-Object System.Drawing.Size(400, 24)
+    $settings.Sensitive.ForeColor = Get-ManoUiColor 'Text'
+    $settings.Sensitive.BackColor = Get-ManoUiColor 'Card'
+    $security.Controls.Add($settings.Sensitive)
+    [void](New-ManoUiLabel -Parent $security -Text 'Titulos extra bloqueados (separados por coma)' -X 16 -Y 112 -W 300 -H 20 -Size 9 -Color 'Muted')
+    $settings.Blocked = New-Object System.Windows.Forms.TextBox
+    $settings.Blocked.Text = (@($script:Cfg.BlockedTitles) -join ', ')
+    $settings.Blocked.Location = New-Object System.Drawing.Point(16, 136)
+    $settings.Blocked.Size = New-Object System.Drawing.Size(480, 26)
+    $settings.Blocked.BackColor = Get-ManoUiColor 'CardAlt'
+    $settings.Blocked.ForeColor = Get-ManoUiColor 'Text'
+    $settings.Blocked.BorderStyle = 'FixedSingle'
+    $security.Controls.Add($settings.Blocked)
+    [void](New-ManoUiLabel -Parent $security -Text 'Atajo global de panico' -X 16 -Y 172 -W 220 -H 20 -Size 9 -Color 'Muted')
+    $settings.Hotkey = New-Object System.Windows.Forms.TextBox
+    $settings.Hotkey.Text = [string]$script:Cfg.PanicHotkey
+    $settings.Hotkey.Location = New-Object System.Drawing.Point(250, 168)
+    $settings.Hotkey.Size = New-Object System.Drawing.Size(150, 26)
+    $settings.Hotkey.BackColor = Get-ManoUiColor 'CardAlt'
+    $settings.Hotkey.ForeColor = Get-ManoUiColor 'Text'
+    $settings.Hotkey.BorderStyle = 'FixedSingle'
+    $security.Controls.Add($settings.Hotkey)
+
+    $advanced = New-ManoUiCard -Parent $Parent -Title 'Avanzado' -X 540 -Y 270 -W 520 -H 250
+    [void](New-ManoUiLabel -Parent $advanced -Text 'Lineas que muestra el registro' -X 16 -Y 48 -W 240 -H 20 -Size 9 -Color 'Muted')
+    $settings.LogLines = New-Object System.Windows.Forms.NumericUpDown
+    $settings.LogLines.Location = New-Object System.Drawing.Point(270, 44)
+    $settings.LogLines.Size = New-Object System.Drawing.Size(100, 26)
+    $settings.LogLines.Minimum = 50
+    $settings.LogLines.Maximum = 5000
+    $settings.LogLines.Increment = 50
+    $settings.LogLines.Value = [int]$script:Cfg.LogLines
+    $settings.LogLines.BackColor = Get-ManoUiColor 'CardAlt'
+    $settings.LogLines.ForeColor = Get-ManoUiColor 'Text'
+    $settings.LogLines.BorderStyle = 'FixedSingle'
+    $advanced.Controls.Add($settings.LogLines)
+    $save = New-ManoUiButton -Parent $advanced -Text 'Guardar ajustes' -X 16 -Y 104 -W 150 -H 40 -Kind primary
+    $save.Add_Click({ Save-ManoGuiSettings })
+    $open = New-ManoUiButton -Parent $advanced -Text 'Abrir config.json' -X 180 -Y 104 -W 150 -H 40 -Kind subtle
+    $open.Add_Click({ Start-Process -FilePath 'notepad.exe' -ArgumentList "`"$($script:ConfigFile)`"" })
+    [void](New-ManoUiLabel -Parent $advanced -Text 'Los cambios se aplican al momento.' -X 16 -Y 160 -W 300 -H 18 -Size 8.5 -Color 'Muted')
+}
+
+function Save-ManoGuiSettings {
+    if (-not $script:Gui -or -not $script:Gui.Settings) { return }
+    $settings = $script:Gui.Settings
+    $new = [ordered]@{}
+    foreach ($key in (Get-ManoDefaultConfig).Keys) { $new[$key] = $script:Cfg[$key] }
+    $new.TargetMonitor = [string]$settings.Target.Text
+    $new.ConfirmMode = [string]$settings.Mode.SelectedItem
+    $new.ConfirmTimeoutSec = [int]$settings.Timeout.Value
+    $new.TrustMaxMinutes = [int]$settings.Trust.Value
+    $new.ShotsDir = [string]$settings.Shots.Text
+    $new.ShotFormat = [string]$settings.Format.SelectedItem
+    $new.ClickDelayMs = [int]$settings.ClickDelay.Value
+    $new.MaxBatchSteps = [int]$settings.Batch.Value
+    $new.Overlay = [bool]$settings.Overlay.Checked
+    $new.BlockSensitiveWindows = [bool]$settings.Sensitive.Checked
+    $new.BlockedTitles = @(([string]$settings.Blocked.Text) -split ',' | ForEach-Object { $_.Trim() } | Where-Object { $_ })
+    $new.PanicHotkey = [string]$settings.Hotkey.Text
+    $new.LogLines = [int]$settings.LogLines.Value
+    Save-ManoConfig $new
+    $loaded = Import-ManoConfig -Path $script:ConfigFile
+    $script:Cfg = $loaded.Config
+    Write-ManoLog 'ajustes guardados desde la interfaz'
+    if ($loaded.Warnings.Count -gt 0) {
+        [void][System.Windows.Forms.MessageBox]::Show(($loaded.Warnings -join [Environment]::NewLine), 'ManoSegura - avisos', 'OK', 'Warning')
+    } else {
+        [void][System.Windows.Forms.MessageBox]::Show('Ajustes guardados.', 'ManoSegura', 'OK', 'Information')
+    }
+    Update-ManoGuiStatus
+}
+
+function Register-ManoGuiHotkey {
+    if (-not $script:Gui -or -not $script:Gui.Form) { return }
+    $g = $script:Gui
+    try {
+        $hotkey = Convert-ManoHotkey ([string]$script:Cfg.PanicHotkey)
+        $g.HotkeyWindow = New-Object ManoForms.HotkeyWindow($g.Form.Handle)
+        $g.HotkeyWindow.add_Hotkey({ Invoke-ManoPanic | Out-Null; Update-ManoGuiStatus })
+        $registered = [ManoNative.Win]::RegisterHotKey($g.Form.Handle, 1, [uint32]$hotkey.Modifiers, [uint32]$hotkey.VirtualKey)
+        if (-not $registered -and $g.SideHotkey) { $g.SideHotkey.Text = 'Panico: atajo no disponible' }
+    } catch {
+        if ($g.SideHotkey) { $g.SideHotkey.Text = 'Panico: atajo no disponible' }
+    }
+}
+
+function Show-ManoGuiLog {
+    if (-not $script:Gui -or -not $script:Gui.LogBox) { return }
+    try {
+        if (Test-Path -LiteralPath $script:LogFile) {
+            $lines = Get-Content -LiteralPath $script:LogFile -Tail ([int]$script:Cfg.LogLines) -Encoding UTF8
+            $script:Gui.LogBox.Text = ($lines -join [Environment]::NewLine)
+        }
+    } catch { }
+}
+
+
+function Get-ManoHelpText {
+    @"
+ManoSegura $($script:Version) - mano remota segura para Windows
+Uso: powershell -NoProfile -ExecutionPolicy RemoteSigned -File .\ManoSegura.ps1 <comando> [args] [opciones]
+
+Sin comando abre la interfaz grafica.
+
+VENTANAS
+  list                        lista ventanas visibles (hwnd, proceso, titulo, monitor)
+  use <hwnd|titulo>           elige la ventana objetivo y la trae al frente
+  monitors                    lista monitores y marca el objetivo
+
+ACCIONES (pueden pedir permiso)
+  shot [ruta]                 captura la ventana objetivo
+  shot --monitor <spec> [ruta]  captura un monitor
+  shot --hwnd <hwnd> [ruta]   captura otra ventana
+  click x y [left|right|double]  clic en coordenadas relativas a la ventana
+  type "texto"                escribe el texto
+  paste "texto"               pega el texto (portapapeles + Ctrl+V)
+  key ctrl+s                  pulsa una combinacion
+  scroll [pasos] [x y]        scroll (negativo abajo)
+  drag x1 y1 x2 y2            arrastra dentro de la ventana
+  wait [ms]                   espera (max 10 s)
+  batch <fichero.json|->       ejecuta varios pasos con un solo permiso
+
+CONTROL
+  status                      estado: ventana, monitor, confianza, desactivada
+  trust [min]                 modo confianza temporal (por defecto 10 min)
+  untrust                     quita el modo confianza
+  panic                       desactiva ManoSegura y corta acciones
+  enable                      reactiva ManoSegura
+  disable                     desactiva ManoSegura
+  config [show|path]          muestra la configuracion o su ruta
+  config set <clave> <valor>  cambia un ajuste
+  config reset                vuelve a la configuracion por defecto
+  check <titulo>              prueba si un titulo esta bloqueado
+  log [lineas]                ultimas lineas del registro
+  version                     version
+  help                        esta ayuda
+
+OPCIONES
+  --dry-run                   no toca el raton/teclado; solo explica que haria
+  --yes                       no pide permiso (solo si tu lo decides)
+  --format png|jpg            formato de captura (shot)
+
+CONFIG (config.json)
+  TargetMonitor: primary | 1 | left | right | x=-1920 | DISPLAY2
+  ConfirmMode: ask (pide permiso) | auto (no pregunta)
+  ConfirmTimeoutSec, TrustMaxMinutes, ShotsDir, ShotFormat, ClickDelayMs,
+  MaxBatchSteps, Overlay, BlockSensitiveWindows, BlockedTitles, PanicHotkey, LogLines
+
+SEGURIDAD
+  - Nunca escribe en campos de contrasena.
+  - Bloquea ventanas de login, correo web, pagos y banca (lista configurable).
+  - La ventana debe estar entera en el monitor objetivo.
+  - Si el vigilante de panico no puede registrarse, la interfaz lo avisa.
+  - Codigo de salida: 0 OK, 1 error, 2 cancelado/rechazado.
+
+Ejemplos:
+  powershell -NoProfile -ExecutionPolicy RemoteSigned -File .\ManoSegura.ps1 ui
+  powershell -NoProfile -ExecutionPolicy RemoteSigned -File .\ManoSegura.ps1 list
+  powershell -NoProfile -ExecutionPolicy RemoteSigned -File .\ManoSegura.ps1 use "Notepad"
+  powershell -NoProfile -ExecutionPolicy RemoteSigned -File .\ManoSegura.ps1 shot
+  powershell -NoProfile -ExecutionPolicy RemoteSigned -File .\ManoSegura.ps1 --dry-run click 100 200
+"@
+}
+
+function Show-ManoStatus {
+    "ManoSegura $($script:Version)"
+    "Ruta: $($script:Root)"
+    "Config: $($script:ConfigFile)"
+    "Activada: $(-not (Test-ManoDisabled))"
+    "Modo confianza: $(Test-ManoTrustActive)"
+    if (Test-ManoTrustActive) {
+        $expiry = Get-ManoTrustExpiry (Get-Content -LiteralPath $script:TrustFile -Raw -ErrorAction SilentlyContinue)
+        if ($expiry) { "Confianza hasta: $($expiry.ToString('yyyy-MM-dd HH:mm:ss'))" }
+    }
+    try {
+        $monitor = Get-ManoTargetMonitor
+        "Monitor objetivo: $($monitor.DeviceName) $(Format-ManoRect $monitor.Bounds)"
+    } catch { "Monitor objetivo: ERROR $($_.Exception.Message)" }
+    $targetText = '(ninguno)'
+    try {
+        if (Test-Path -LiteralPath $script:TargetFile) {
+            $value = [int64]0
+            if ([int64]::TryParse((Get-Content -LiteralPath $script:TargetFile -Raw).Trim(), [ref]$value)) {
+                $hwnd = [IntPtr]$value
+                if ([ManoNative.Win]::IsWindow($hwnd)) { $targetText = "$value  $(Get-ManoWindowTitle $hwnd)" }
+            }
+        }
+    } catch { }
+    "Ventana objetivo: $targetText"
+    "Capturas: $($script:ShotsDir)"
+    "Atajo de panico: $($script:Cfg.PanicHotkey)"
+    "Config: ConfirmMode=$($script:Cfg.ConfirmMode) Timeout=$($script:Cfg.ConfirmTimeoutSec)s TrustMax=$($script:Cfg.TrustMaxMinutes)min Overlay=$($script:Cfg.Overlay)"
+    if ($script:Warnings.Count -gt 0) {
+        'Avisos de configuracion:'
+        foreach ($w in $script:Warnings) { "  - $w" }
+    }
+}
+
+function Show-ManoMonitors {
+    $monitors = Get-ManoMonitors
+    $target = $null
+    try { $target = Get-ManoTargetMonitor } catch { }
+    $index = 0
+    foreach ($monitor in $monitors) {
+        $mark = if ($target -and $target.DeviceName -eq $monitor.DeviceName) { '*' } else { ' ' }
+        "[$index] $mark $($monitor.DeviceName)  $(Format-ManoRect $monitor.Bounds)  primario=$($monitor.Primary)  id=$($monitor.MonitorId)"
+        $index++
+    }
+    if ($script:Cfg.TargetMonitor) { "Objetivo configurado: $($script:Cfg.TargetMonitor)" }
+}
+
+function Show-ManoWindowList {
+    $windows = Get-ManoWindows
+    "{0,8}  {1,-16} {2,-16} {3,-44} {4}" -f 'Hwnd', 'Proceso', 'Monitor', 'Titulo', 'Bloq.'
+    foreach ($window in $windows) {
+        $process = if ($window.Proceso) { $window.Proceso } else { '?' }
+        $monitor = if ($window.Monitor) { $window.Monitor } else { '-' }
+        $blocked = if ($window.Bloqueada) { 'SI' } else { 'no' }
+        "{0,8}  {1,-16} {2,-16} {3,-44} {4}" -f $window.Hwnd, (Get-ManoClipped $process 16), (Get-ManoClipped $monitor 16), (Get-ManoClipped $window.Titulo 44), $blocked
+    }
+    "Total: $($windows.Count) ventanas"
+}
+
+function Show-ManoConfig {
+    $defaults = Get-ManoDefaultConfig
+    foreach ($key in $defaults.Keys) {
+        $value = $script:Cfg[$key]
+        if ($value -is [array]) { $value = (@($value) -join ', ') }
+        "$key = $value"
+    }
+    "Fichero: $($script:ConfigFile)"
+    if ($script:Warnings.Count -gt 0) {
+        'Avisos:'
+        foreach ($w in $script:Warnings) { "  - $w" }
+    }
+}
+
+function Initialize-ManoCliEnvironment {
+    Initialize-ManoEnvironment -RootPath $script:Root
+}
+
+# =====================================================================================================
+# 13. Punto de entrada / entry point
+# =====================================================================================================
+function Invoke-ManoMain {
+    param([string[]]$RawArguments = @())
+
+    Initialize-ManoCliEnvironment
+    $argsList = New-Object System.Collections.Generic.List[string]
+    $commandName = ''
+    foreach ($argument in @($RawArguments)) {
+        switch ($argument) {
+            '--dry-run' { $script:DryRun = $true; continue }
+            '--yes' { $script:AutoYes = $true; continue }
+            '--help' { if (-not $commandName) { $commandName = 'help' }; continue }
+            '--version' { if (-not $commandName) { $commandName = 'version' }; continue }
+            default {
+                if (-not $commandName -and -not $argument.StartsWith('-')) {
+                    $commandName = $argument
+                } else {
+                    $argsList.Add($argument)
+                }
+                continue
+            }
+        }
+    }
+
+    $name = if ($commandName) { $commandName.ToLowerInvariant() } else { 'ui' }
+    if ($name -eq 'focus') { $name = 'use' }
+    Write-ManoLog "CMD: $name $((Get-ManoClipped ($argsList -join ' ') 200))$(if ($script:DryRun) { ' [dry-run]' })"
+
+    try {
+        switch ($name) {
+            'ui' { Show-ManoGui; return }
+            'version' { "ManoSegura $($script:Version)"; return }
+            'help' { Get-ManoHelpText; return }
+            'monitors' { Show-ManoMonitors; return }
+            'list' { Show-ManoWindowList; return }
+            'status' { Show-ManoStatus; return }
+            'use' {
+                if (-not $argsList.Count) { Throw-ManoError 'Uso: use <hwnd|titulo>' 1 }
+                $window = Find-ManoWindow ($argsList -join ' ')
+                $hwnd = [IntPtr][int64]$window.Hwnd
+                [void](Assert-ManoWindowAllowed $hwnd)
+                [void](Assert-ManoWindowOnMonitor $hwnd)
+                if (-not (Confirm-ManoAction "Elegir como ventana objetivo y traerla al frente:`r`n$($window.Titulo)")) { Throw-ManoError 'CANCELADO: use' 2 }
+                Set-ManoTarget $hwnd
+                [void](Focus-ManoWindow $hwnd)
+                "Objetivo: $($window.Hwnd)  $($window.Titulo)"
+                return
+            }
+            'shot' { Invoke-ManoAction -Action screenshot -ActionArgs $argsList.ToArray(); return }
+            'screenshot' { Invoke-ManoAction -Action screenshot -ActionArgs $argsList.ToArray(); return }
+            'click' { Invoke-ManoAction -Action click -ActionArgs $argsList.ToArray(); return }
+            'type' { Invoke-ManoAction -Action type -ActionArgs $argsList.ToArray(); return }
+            'paste' { Invoke-ManoAction -Action paste -ActionArgs $argsList.ToArray(); return }
+            'key' { Invoke-ManoAction -Action key -ActionArgs $argsList.ToArray(); return }
+            'scroll' { Invoke-ManoAction -Action scroll -ActionArgs $argsList.ToArray(); return }
+            'drag' { Invoke-ManoAction -Action drag -ActionArgs $argsList.ToArray(); return }
+            'wait' { Invoke-ManoAction -Action wait -ActionArgs $argsList.ToArray(); return }
+            'batch' {
+                if (-not $argsList.Count) { Throw-ManoError 'Uso: batch <fichero.json|->' 1 }
+                Invoke-ManoBatchFile -Source ($argsList -join ' ')
+                return
+            }
+            'trust' {
+                $minutes = 10
+                if ($argsList.Count -ge 1) {
+                    $parsedMinutes = 0
+                    if ([int]::TryParse($argsList[0], [ref]$parsedMinutes)) { $minutes = $parsedMinutes }
+                }
+                [void](Set-ManoTrustMinutes $minutes)
+                "OK modo confianza $minutes min"
+                return
+            }
+            'untrust' { Clear-ManoTrust; 'OK modo confianza desactivado'; return }
+            'panic' { Invoke-ManoPanic; return }
+            'disable' { Set-ManoDisabled -Disabled $true; 'OK ManoSegura desactivada'; return }
+            'enable' { Set-ManoDisabled -Disabled $false; 'OK ManoSegura activada'; return }
+            'config' {
+                if (-not $argsList.Count -or $argsList[0] -eq 'show') { Show-ManoConfig; return }
+                if ($argsList[0] -eq 'path') { $script:ConfigFile; return }
+                if ($argsList[0] -eq 'reset') {
+                    Save-ManoConfig (Get-ManoDefaultConfig)
+                    Initialize-ManoEnvironment -RootPath $script:Root
+                    'OK configuracion por defecto'
+                    return
+                }
+                if ($argsList[0] -eq 'set' -and $argsList.Count -ge 3) {
+                    Set-ManoConfigValue -Key $argsList[1] -Value (($argsList | Select-Object -Skip 2) -join ' ')
+                    return
+                }
+                Throw-ManoError 'Uso: config [show|path|reset] | config set <clave> <valor>' 1
+            }
+            'check' {
+                if (-not $argsList.Count) { Throw-ManoError 'Uso: check <titulo>' 1 }
+                $title = $argsList -join ' '
+                $blocked = Test-ManoTitleBlocked -Title $title -Extra $script:Cfg.BlockedTitles
+                if ($blocked) { "BLOQUEADA: $title" } else { "permitida: $title" }
+                return
+            }
+            'log' {
+                $lines = if ($argsList.Count -ge 1) { [int]$argsList[0] } else { 40 }
+                if (Test-Path -LiteralPath $script:LogFile) { Get-Content -LiteralPath $script:LogFile -Tail $lines -Encoding UTF8 } else { 'Sin registro todavia.' }
+                return
+            }
+            default {
+                Get-ManoHelpText
+                Throw-ManoError "Comando desconocido: $CommandName" 2
+            }
+        }
+    } catch [ManoError] {
+        Write-ManoLog ('ERROR: ' + $_.Exception.Message)
+        Write-Output ('ERROR: ' + $_.Exception.Message)
+        $script:ExitCode = [int]$_.Exception.Code
+        return
+    } catch {
+        Write-ManoLog ('EXCEPCION: ' + $_.Exception.Message)
+        Write-Output ('ERROR: ' + $_.Exception.Message)
+        $script:ExitCode = 1
+        return
+    }
+}
+
+if (-not $script:IsLibrary) {
+    $script:ExitCode = 0
+    Invoke-ManoMain -RawArguments $Arguments
+    exit $script:ExitCode
+}

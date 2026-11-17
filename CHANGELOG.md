@@ -2,44 +2,36 @@
 
 Formato basado en [Keep a Changelog](https://keepachangelog.com/es-ES/1.1.0/); versiones [SemVer](https://semver.org/lang/es/).
 
-## [1.1.0] - 2026-10-18
+## [2.0.0] - 2026-11-17
 
-### Antivirus / instalación
-- Ya no hace falta `-ExecutionPolicy Bypass`. README con instalación `Unblock-File` + `RemoteSigned` (o `-ExecutionPolicy RemoteSigned` por llamada), firma propia opcional y una sección para Kaspersky (exclusión por carpeta o hash; nunca confiar en `powershell.exe`).
-- El vigilante de pánico ya no es un PowerShell oculto con `Bypass`. Ahora es un proceso visible (consola minimizada) con **icono en la bandeja**, **cartel** en el monitor objetivo y menú (pánico, quitar confianza, abrir registros, cerrar). Se cierra solo tras `GuardIdleMinutes` sin acciones.
-- Sin Base64, `-EncodedCommand`, `Invoke-Expression`, descargas ni scripts temporales. Un test lo comprueba.
+### Añadido
+- **Interfaz gráfica** (`ui`, o sin argumentos): pestañas de Ventanas, Acciones, Ajustes y Registro; lista de ventanas con hwnd/proceso/título/monitor/bloqueada; botones de pánico, activar y confiar; borde visible sobre la ventana objetivo y atajo global de pánico.
+- Comandos `drag`, `focus` (también dentro de batch), `config set`, `monitors`.
+- Opciones globales `--yes`, `--dry-run` y `--format png|jpg`.
+- Ajustes nuevos: `ConfirmMode` (`ask`/`auto`), `ClickDelayMs`, `MaxBatchSteps`, `BlockedTitles`, `ShotFormat`, `LogLines`, `PanicHotkey`.
+- Ejemplo de batch actualizado y `config.example.json` nuevo.
+- Tests Pester 5 reescritos y CI para PowerShell 5.1 y 7.
 
-### Seguridad (las reglas de la 1.0 se mantienen todas)
-- `navigate <url>`: única forma de usar la barra de direcciones. Solo `http`/`https`, sin credenciales en la URL, con bloqueo duro de correo, X, pagos, bancos y login. Modos `Navigation` `off` (por defecto), `allowlist` o `ask`; fuera de `UrlAllowlist` siempre pregunta, aunque haya modo confianza.
-- En navegadores se bloquean los atajos de barra de direcciones (`Ctrl+L`, `Alt+D`, `F6`, `Ctrl+E`, `Ctrl+K`…), escribir o pegar en la barra de direcciones y abrir pestañas o ventanas nuevas (`Ctrl+T`, `Ctrl+N`, `Ctrl+Shift+N`, `Ctrl+Shift+T`, `Ctrl+Shift+P`, `Alt+Enter`…) salvo `AllowNewTabs`.
-- Tras cada acción se comprueba que no haya aparecido ninguna ventana de navegador nueva y que la ventana no haya pasado a una página prohibida. Si ocurre, para y quita el modo confianza.
-- Límite de velocidad `MaxActionsPerMinute` (60 por defecto, tope 300), compartido entre procesos. Código de salida `4`.
-- Borde visible (naranja; rojo en modo confianza) alrededor de la ventana controlada. No roba el foco y deja pasar los clics.
-- Registro de auditoría `logs/audit.jsonl` con cadena de hashes SHA-256 y `state/audit.head`. Nuevo comando `verify-log`.
-- Nuevas reglas duras de títulos: gestores de contraseñas, antivirus o seguridad de Windows o UAC, más correo web y pagos, y los diálogos de ManoSegura.
-- `Alt+Tab`, `Alt+Esc` y `Ctrl+Esc` bloqueados. `Alt+F4` se bloquea con cualquier modificador extra.
-- `type` escribe en trozos y comprueba entre trozos que la ventana objetivo sigue al frente y que no se ha pulsado pánico. `wait` también se corta con el pánico.
-- `enable` ya no borra la marca de desactivado antes de que confirmes.
-- `TrustMaxMinutes` con tope duro de 240. Se ignoran ficheros `trust.txt` con caducidad imposible.
-- `batch` valida todos los pasos (teclas y URLs) antes de pedir permiso. `screenshot` solo guarda `.png`.
+### Cambiado
+- La seguridad pasa a ser **más simple**: una ventana y un monitor, permiso (o confianza), bloqueo de contraseñas/correo/pagos, pánico y registro. Se mantiene el bloqueo de campos de contraseña por UI Automation.
+- El modo confianza tiene tope (`TrustMaxMinutes`) y caducidad real; ya no hay proceso vigilante obligatorio: el atajo de pánico se registra mientras la interfaz está abierta.
+- Los errores son textos claros; códigos de salida 0/1/2.
 
-### Robustez
-- DPI por monitor (Per-Monitor v2, con alternativas) y diálogo escalado al DPI del monitor.
-- Monitores con coordenadas negativas: `TargetMonitor` acepta `left`/`right`, `x=-1920`, un punto `-1920,0` y `DISPLAY2`.
-- Errores con id estable y texto en español e inglés (`Language`, `--en`, `--es`).
-- `--json` (o `MANOSEGURA_JSON=1`): un objeto JSON por llamada, solo ASCII y válido con cualquier página de códigos.
-- `config.json` validado, con mensajes claros (tipos, rangos, opciones).
-- Nuevos comandos: `config`, `check-url`, `check-key`, `verify-log`.
+### Eliminado
+- Cadena de hashes de auditoría con SHA-256 y `verify-log` (queda un registro de texto simple).
+- Proceso vigilante separado, banner/consola minimizada y modo `-ExecutionPolicy Bypass`.
+- Reglas especiales de navegadores (barra de direcciones, pestañas nuevas), listas de URLs, `navigate`, JSON de salida y sistema bilingüe de mensajes de la 1.1.
+- Límite de acciones por minuto y cadena de auditoría: menos protocolo, menos fricción.
 
-### Calidad
-- PSScriptAnalyzer limpio (`PSScriptAnalyzerSettings.psd1`).
-- Tests Pester en `tests/`.
-- GitHub Actions en `windows-latest` con Windows PowerShell 5.1 y PowerShell 7.
-- Dot-sourcing con `MANOSEGURA_LIBRARY=1` para tests.
+### Seguridad
+- La ventana debe estar entera en el monitor objetivo.
+- `type`/`paste` comprueban el campo enfocado y se niegan a escribir en contraseñas.
+- Títulos de login, correo, pagos y banca bloqueados por defecto (ampliable).
+- `panic` desactiva ManoSegura, revoca la confianza y detiene los batch en el siguiente paso.
 
-### Cambios incompatibles
-- En navegadores, `key ctrl+l` + `paste url` ya no funciona: usa `navigate <url>` y pon `Navigation` en `allowlist` o `ask`.
-- Si el vigilante de pánico no puede arrancar, las acciones se rechazan (`E_GUARD`) en lugar de seguir sin pánico.
+### Notas
+- Probado en Windows 11 con PowerShell 5.1; la CI cubre PowerShell 5.1 y 7.
+- La 1.0.0 sigue disponible en el historial de git.
 
 ## [1.0.0] - 2026-10-16
-- Primera versión.
+- Primera versión: una ventana, un monitor, permiso por acción, modo confianza, pánico, capturas y CLI.
