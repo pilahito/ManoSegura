@@ -44,6 +44,8 @@ PowerShell 5.1+, script único en ejecución, sin admin; incluye compilación op
 |---|---|
 | `monitors`, `list-windows`, `status`, `version` | Información |
 | `focus <hwnd\|título>` | Elige ventana objetivo (por hwnd es lo más fiable) |
+| `controls` | Lista botones accesibles sin leer campos de texto |
+| `invoke <número>` | Activa un botón accesible con permiso por acción |
 | `screenshot [ruta.png]` | Captura la ventana objetivo |
 | `screenshot monitor [nombre\|n] [ruta.png]` | Captura un monitor |
 | `screenshot hwnd <hwnd> [ruta.png]` | Captura otra ventana |
@@ -81,6 +83,8 @@ Códigos de salida: `0` OK, `2` rechazado por seguridad/error, `3` cancelado por
 ### Commands
 Same as the table above. `--dry-run` simulates. Exit codes: `0` ok, `2` refused/error, `3` cancelled by user.
 
+Build the console executable on Windows with `powershell -NoProfile -ExecutionPolicy Bypass -File .\build-exe.ps1`; GitHub Actions also publishes a downloadable artifact on pull requests and main-branch builds.
+
 ---
 
 ## For AI assistants / Para asistentes de IA
@@ -92,6 +96,8 @@ function mano { powershell -NoProfile -ExecutionPolicy Bypass -File $M @args }
 mano list-windows                 # find the hwnd
 mano focus 123456                 # user approves once (can enable trust mode)
 mano screenshot                   # -> shots\latest.png, look at it
+mano controls                     # list accessible buttons
+mano invoke 2                     # user approves the specific control
 mano click 200 140
 mano paste "hello"
 mano key enter
