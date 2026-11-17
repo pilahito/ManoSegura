@@ -11,5 +11,7 @@
   "BlockSensitiveWindows": true,
   "BlockedTitles": [],
   "PanicHotkey": "Ctrl+Alt+P",
-  "LogLines": 500
+  "LogLines": 500,
+  "AiName": "IA",
+  "ShowAiLabel": true
 }

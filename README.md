@@ -17,6 +17,9 @@ PowerShell 5.1 o 7 · un solo archivo · sin descargas · sin admin · sin `-Exe
 - **Menos protocolo**: desaparecen el proceso vigilante obligatorio, la cadena de hashes de auditoría, el JSON de respuesta y las reglas especiales de navegadores. Queda lo importante: una ventana, un monitor, permiso, bloqueo de contraseñas/correo/pagos y pánico.
 - **Comandos nuevos**: `ui`, `drag`, `focus` dentro de batch, `config set`, `--yes`, `--format png|jpg`.
 - **Registro sencillo** (`logs/manosegura.log`) y capturas en `shots/` (con `latest.png`).
+- **Tiempo de confianza ampliable**: presets 10 min / 30 min / 1 h / 2 h / 3 h o personalizado; boton **Ampliar tiempo** y `trust add` para sumar minutos.
+- **Nombre de la IA junto al raton**: el cursor lleva una etiqueta con el nombre de la IA (`ai Claude`, `--ai Claude`, ajustes `AiName` y `ShowAiLabel`).
+- **.exe listo**: `build.ps1` genera `dist/ManoSegura.exe` (GUI + CLI en un ejecutable).
 
 ## Requisitos
 
@@ -90,6 +93,22 @@ En la interfaz, elige **10 min**, **30 min**, **1 h**, **2 h**, **3 h** o **Pers
 
 El máximo total lo pone `TrustMaxMinutes` en `config.json` (120 por defecto, hasta 1440). `status` muestra los minutos restantes.
 
+## Nombre de la IA junto al raton
+
+ManoSegura muestra una etiqueta flotante al lado del cursor con el nombre de la IA que esta usando la mano remota (por ejemplo `Claude`). Se ve mientras la interfaz esta abierta y durante las acciones lanzadas por CLI, no intercepta clics y se puede desactivar.
+
+![Etiqueta de la IA junto al cursor](docs/cursor-badge.png)
+
+```powershell
+.\ManoSegura.ps1 ai Claude          # cambia el nombre actual
+.\ManoSegura.ps1 --ai Claude list   # nombre para esta llamada (y lo guarda)
+.\ManoSegura.ps1 ai                 # muestra el nombre actual
+```
+
+- `AiName`: nombre por defecto en `config.json` (si no hay ninguno guardado).
+- `ShowAiLabel`: `true`/`false` para mostrar u ocultar la etiqueta.
+- El nombre tambien aparece en el titulo de la ventana, en la barra de estado y en el dialogo de permiso ("Claude quiere hacer esto...").
+
 ## Comandos
 
 | Comando | Descripción |
@@ -108,6 +127,7 @@ El máximo total lo pone `TrustMaxMinutes` en `config.json` (120 por defecto, ha
 | `drag x1 y1 x2 y2` | Arrastra dentro de la ventana. |
 | `wait [ms]` | Espera (máximo 10 s). |
 | `batch <fichero.json\|->` | Varios pasos con un solo permiso. |
+| `ai [nombre]` | Muestra o cambia el nombre de la IA (ej: `ai Claude`). |
 | `status` | Estado completo. |
 | `trust [tiempo]` | Modo confianza: `10m`, `30m`, `1h`, `2h`, `3h`, `90`, `1h30m` (por defecto 10 min). |
 | `trust add <tiempo>` / `trust +30m` | Añade tiempo a la confianza activa. |
@@ -124,6 +144,7 @@ Opciones globales:
 - `--dry-run`: no toca ratón ni teclado; explica qué haría.
 - `--yes`: no pide permiso (decisión tuya).
 - `--format png|jpg`: formato de captura.
+- `--ai <nombre>`: nombre de la IA que controla (se muestra junto al raton y queda guardado).
 
 Códigos de salida: `0` correcto, `1` error, `2` cancelado o rechazado.
 
@@ -143,6 +164,8 @@ Códigos de salida: `0` correcto, `1` error, `2` cancelado o rechazado.
 | `BlockSensitiveWindows` | `true` | Bloquea login, correo, pagos y banca. |
 | `BlockedTitles` | `[]` | Títulos extra bloqueados (por ejemplo `["Mi banco"]`). |
 | `PanicHotkey` | `Ctrl+Alt+P` | Atajo global de pánico (letras, números o F1–F12). |
+| `AiName` | `IA` | Nombre de la IA que aparece junto al ratón (hasta 32 caracteres). |
+| `ShowAiLabel` | `true` | Mostrar la etiqueta con el nombre de la IA junto al cursor. |
 | `LogLines` | `500` | Líneas que muestra el registro. |
 
 Ejemplo en `config.example.json`. La configuración se valida al cargar: si algo no vale, se usa el valor por defecto y se avisa (en la GUI o con `status`).
@@ -181,6 +204,20 @@ Hay un ejemplo en `examples/steps.example.json`. Todos los pasos se validan ante
 3. `trust 1h` (o `ConfirmMode=auto` en un entorno controlado) → trabaja sin interrumpirte; si se acaba, `trust add 30m`.
 4. El asistente hace `click`, `type`, `key`, `shot`…
 5. `panic` (o `Ctrl+Alt+P`) si algo va mal.
+
+## Crear el .exe
+
+Con el modulo [ps2exe](https://www.powershellgallery.com/packages/ps2exe) instalado:
+
+```powershell
+.\build.ps1
+```
+
+Genera `dist\ManoSegura.exe` (consola + GUI en el mismo ejecutable): al abrirlo sin argumentos abre la interfaz y oculta la consola; con comandos (`version`, `list`, `trust 1h`...) funciona como la version `.ps1`. Tambien genera el icono `assets\manosegura.ico`.
+
+- Sigue necesitando Windows PowerShell 5.1 (incluido en Windows 10/11).
+- No esta firmado: algunos antivirus pueden avisar de un ejecutable generado desde un script; es normal. Si te pasa, añade una exclusion del archivo o de la carpeta.
+- Para compilar tu mismo: `.\build.ps1 -OutputDir .\dist -Version 2.0.0.0`.
 
 ## Desarrollo
 

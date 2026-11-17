@@ -22,7 +22,9 @@ Describe 'Configuracion' {
         $cfg.Keys | Should -Contain 'TargetMonitor'
         $cfg.Keys | Should -Contain 'ConfirmMode'
         $cfg.Keys | Should -Contain 'PanicHotkey'
-        $cfg.Keys | Should -HaveCount 13
+        $cfg.Keys | Should -Contain 'AiName'
+        $cfg.Keys | Should -Contain 'ShowAiLabel'
+        $cfg.Keys | Should -HaveCount 15
         $cfg.ConfirmMode | Should -Be 'ask'
         $cfg.PanicHotkey | Should -Be 'Ctrl+Alt+P'
     }
@@ -229,6 +231,38 @@ Describe 'Utilidades' {
         foreach ($token in @('ui', 'list', 'use', 'shot', 'click', 'type', 'key', 'drag', 'batch', 'trust', 'panic', 'config')) {
             $help | Should -Match ([regex]::Escape($token))
         }
+    }
+}
+
+Describe 'Nombre de la IA' {
+    It 'usa IA por defecto' {
+        Remove-Item -LiteralPath $script:AiFile -Force -ErrorAction SilentlyContinue
+        $script:Cfg.AiName = 'IA'
+        Get-ManoAiName | Should -Be 'IA'
+    }
+
+    It 'guarda y devuelve el nombre de la IA' {
+        Set-ManoAiName 'Claude' | Should -Be 'Claude'
+        Get-ManoAiName | Should -Be 'Claude'
+        (Get-Content -LiteralPath $script:AiFile -Raw).Trim() | Should -Be 'Claude'
+    }
+
+    It 'usa el nombre configurado si no hay estado guardado' {
+        Remove-Item -LiteralPath $script:AiFile -Force -ErrorAction SilentlyContinue
+        $script:Cfg.AiName = 'Copilot'
+        Get-ManoAiName | Should -Be 'Copilot'
+    }
+
+    It 'la variable de entorno tiene prioridad' {
+        $env:MANOSEGURA_AI_NAME = 'Gemini'
+        Get-ManoAiName | Should -Be 'Gemini'
+        Remove-Item Env:\MANOSEGURA_AI_NAME -ErrorAction SilentlyContinue
+    }
+
+    It 'limpia y valida el nombre' {
+        { Set-ManoAiName '' } | Should -Throw
+        $long = ('x' * 50)
+        Set-ManoAiName $long | Should -Be ('x' * 32)
     }
 }
 
