@@ -3,7 +3,7 @@
 **ES** · Una "mano remota" segura para que un asistente de IA controle **una sola ventana** en **un monitor elegido** de Windows, siempre con tu permiso.
 **EN** · A safe "remote hand" that lets an AI assistant control **one window** on **one chosen monitor** in Windows — always with your permission.
 
-PowerShell 5.1+, un solo archivo, sin descargas, sin admin. / Single file, no downloads, no admin.
+PowerShell 5.1+, script único en ejecución, sin admin; incluye compilación opcional a EXE. / Single-file runtime, no admin; optional EXE build included.
 
 ---
 
@@ -18,6 +18,17 @@ PowerShell 5.1+, un solo archivo, sin descargas, sin admin. / Single file, no do
    Pon en `TargetMonitor`: `primary`, un índice (`1`), el nombre (`\\.\DISPLAY2`) o parte del ID del monitor (`ACR`, `DEL`...).
    También vale la variable de entorno `MANOSEGURA_MONITOR`.
 3. Arranca la escucha de pánico: `.\ManoSegura.ps1 start-panic` (se arranca sola en la primera acción).
+
+### Ejecutar como EXE
+1. Ejecuta `powershell -NoProfile -ExecutionPolicy Bypass -File .\build-exe.ps1`. La primera vez descarga PS2EXE desde PowerShell Gallery.
+2. El resultado aparece en `dist\ManoSegura.exe`. Mantiene los comandos de consola y el mismo permiso por acción.
+3. En GitHub Actions, la compilación deja el EXE como artefacto descargable durante 30 días.
+
+### Prisma Launcher y otras aplicaciones
+- Inicia sesión tú en Microsoft/Prism Launcher. Las pantallas de login y contraseña siguen bloqueadas.
+- Después, usa `list-windows`, `focus <hwnd>`, `screenshot` y `controls` para inspeccionar la ventana.
+- `invoke <número>` activa un botón o elemento accesible y siempre pide permiso. Si la aplicación no expone controles accesibles, usa `click` tras revisar una captura.
+- Los campos de texto y contraseña no se leen ni se enumeran.
 
 ### Seguridad
 - **Permiso por acción**: aparece un diálogo en tu monitor (Permitir / Cancelar; se cancela solo a los 20 s).
