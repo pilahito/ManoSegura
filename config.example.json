@@ -1,7 +1,17 @@
 {
   "TargetMonitor": "primary",
-  "ShotsDir": "",
+  "ConfirmMode": "ask",
   "ConfirmTimeoutSec": 20,
-  "TrustMaxMinutes": 60,
-  "ExtraBlockedTitles": []
+  "TrustMaxMinutes": 120,
+  "ShotsDir": "",
+  "ShotFormat": "png",
+  "ClickDelayMs": 30,
+  "MaxBatchSteps": 50,
+  "Overlay": true,
+  "BlockSensitiveWindows": true,
+  "BlockedTitles": [],
+  "PanicHotkey": "Ctrl+Alt+P",
+  "LogLines": 500,
+  "AiName": "IA",
+  "ShowAiLabel": true
 }
